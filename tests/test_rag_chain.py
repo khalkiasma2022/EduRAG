@@ -137,14 +137,21 @@ def test_top_k_is_forwarded() -> None:
     assert [source["page_number"] for source in result["sources"]] == [1, 2]
 
 
-def test_missing_information_does_not_call_the_llm() -> None:
-    chain, _embeddings, _store, llm = _chain([])
+def test_missing_passages_call_general_knowledge() -> None:
+    """Aucun passage : Qwen répond avec ses connaissances, sans source PDF."""
+    chain, embeddings, store, llm = _chain([])
 
     result = chain.ask("Quelle est la capitale du Japon ?")
+    prompt = llm.prompts[0]
 
-    assert result["answer"] == ABSENT_ANSWER
+    assert embeddings.questions == ["Quelle est la capitale du Japon ?"]
+    assert store.calls == [([0.2, 0.8], 3)]
+    assert result["answer"] == "Une variable est un nom qui désigne une valeur."
     assert result["sources"] == []
-    assert llm.prompts == []
+    assert "Aucun passage n'a été trouvé dans les documents." in prompt
+    assert ABSENT_ANSWER in prompt
+    assert "Connaissances générales" in prompt
+    assert "Tu n'inventes jamais de nom de fichier ni de numéro de page." in prompt
 
 
 def test_components_are_reused_for_each_question() -> None:
@@ -247,6 +254,39 @@ def test_context_too_large_raises() -> None:
         chain.ask("Résume le passage")
 
     assert llm.prompts == []
+
+
+def test_prompt_checks_relevance_and_separates_origins() -> None:
+    chain, _embeddings, _store, llm = _chain([_passage("Une classe sert à créer des objets.", 4)])
+
+    chain.ask("A quoi sert une classe ?")
+    prompt = llm.prompts[0]
+
+    assert "ne répond pas forcément à la question" in prompt
+    assert "Tu cites uniquement les fichiers et les pages présents dans le contexte." in prompt
+    assert "D'après les documents" in prompt
+    assert "Connaissances générales" in prompt
+    assert ABSENT_ANSWER in prompt
+    assert "cours_python.pdf" in prompt
+    assert "Page : 4" in prompt
+
+
+def test_answer_cannot_add_a_source() -> None:
+    chain, _embeddings, _store, llm = _chain([_passage("Une variable est un nom qui désigne une valeur.")])
+    llm.answer = "Selon autre_cours.pdf, page 99, une variable est un nom."
+
+    result = chain.ask("Qu'est-ce qu'une variable ?")
+
+    assert result["answer"] == "Selon autre_cours.pdf, page 99, une variable est un nom."
+    assert result["sources"] == [
+        {
+            "filename": "cours_python.pdf",
+            "page_number": 12,
+            "chunk_id": 3,
+            "text": "Une variable est un nom qui désigne une valeur.",
+        }
+    ]
+    assert "autre_cours.pdf" not in [source["filename"] for source in result["sources"]]
 
 
 def test_malicious_context_stays_data() -> None:

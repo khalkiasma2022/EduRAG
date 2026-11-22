@@ -181,11 +181,18 @@ def _read_chunk(chunk: object) -> tuple[str, dict[str, str | int]]:
     if isinstance(chunk_id, bool) or not isinstance(chunk_id, int):
         raise TypeError("chunk_id doit être un entier.")
 
-    return text, {
+    metadata: dict[str, str | int] = {
         "filename": filename,
         "page_number": page_number,
         "chunk_id": chunk_id,
     }
+    # Les anciens chunks n'ont pas ce champ : on ne le rend pas obligatoire.
+    if "document_id" in chunk:
+        document_id = chunk["document_id"]
+        if not isinstance(document_id, str) or document_id.strip() == "":
+            raise ValueError("document_id doit être une chaîne de caractères non vide.")
+        metadata["document_id"] = document_id.strip()
+    return text, metadata
 
 
 def _check_top_k(top_k: object) -> None:
@@ -198,14 +205,16 @@ def _passages_from_matches(found: list) -> list[dict[str, str | int]]:
     passages: list[dict[str, str | int]] = []
     for document, _distance in found:
         metadata = document.metadata
-        passages.append(
-            {
-                "text": document.page_content,
-                "filename": metadata["filename"],
-                "page_number": metadata["page_number"],
-                "chunk_id": metadata["chunk_id"],
-            }
-        )
+        passage: dict[str, str | int] = {
+            "text": document.page_content,
+            "filename": metadata["filename"],
+            "page_number": metadata["page_number"],
+            "chunk_id": metadata["chunk_id"],
+        }
+        document_id = metadata.get("document_id")
+        if isinstance(document_id, str) and document_id.strip() != "":
+            passage["document_id"] = document_id
+        passages.append(passage)
     return passages
 
 

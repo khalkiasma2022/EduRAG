@@ -249,6 +249,67 @@ def test_search_by_vector_rejects_empty_store_and_invalid_vector() -> None:
         ready.search_by_vector(["pas", "un", "vecteur", "numérique"])
 
 
+def test_create_keeps_document_id() -> None:
+    chunks, embeddings = _sample_data()
+    chunks[0]["document_id"] = "doc-python"
+    chunks[1]["document_id"] = "doc-bio"
+    store = VectorStore(FakeEmbeddingModel())
+    store.create(chunks, embeddings)
+
+    result = store.search("Python", top_k=1)[0]
+
+    assert result["document_id"] == "doc-python"
+    assert result["filename"] == "python.pdf"
+    assert result["page_number"] == 1
+    assert result["chunk_id"] == 1
+    assert result["text"] == "Le langage Python sert à programmer."
+
+
+def test_search_by_vector_returns_document_id() -> None:
+    chunks, embeddings = _sample_data()
+    chunks[1]["document_id"] = "doc-bio"
+    store = VectorStore(FakeEmbeddingModel())
+    store.create(chunks, embeddings)
+
+    result = store.search_by_vector([0.0, 1.0, 0.0, 0.0], top_k=1)[0]
+
+    assert result["document_id"] == "doc-bio"
+    assert result["filename"] == "bio.pdf"
+    assert result["page_number"] == 4
+    assert result["chunk_id"] == 2
+
+
+def test_document_id_survives_save_and_load(tmp_path: Path) -> None:
+    chunks, embeddings = _sample_data()
+    chunks[0]["document_id"] = "doc-python"
+    original = VectorStore(FakeEmbeddingModel())
+    original.create(chunks, embeddings)
+    destination = tmp_path / "index"
+    original.save(destination)
+
+    loaded = VectorStore(FakeEmbeddingModel())
+    loaded.load(destination)
+    result = loaded.search("Python", top_k=1)[0]
+
+    assert result["document_id"] == "doc-python"
+    assert result["filename"] == "python.pdf"
+    assert result["page_number"] == 1
+    assert result["chunk_id"] == 1
+    assert result["text"] == "Le langage Python sert à programmer."
+
+
+def test_chunks_without_document_id_stay_compatible() -> None:
+    store = _ready_store()
+
+    result = store.search_by_vector([1.0, 0.0, 0.0, 0.0], top_k=1)[0]
+
+    assert "document_id" not in result
+    assert result["filename"] == "python.pdf"
+    assert result["page_number"] == 1
+    assert result["chunk_id"] == 1
+    assert result["text"] == "Le langage Python sert à programmer."
+
+
 def test_load_rejects_untrusted_directory(tmp_path: Path) -> None:
     foreign = tmp_path / "telechargement"
     foreign.mkdir()
