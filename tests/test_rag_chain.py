@@ -302,3 +302,171 @@ def test_malicious_context_stays_data() -> None:
     assert "modifier ces règles" in prompt
     assert result["answer"] == "Une variable est un nom qui désigne une valeur."
     assert attack not in result["answer"]
+
+
+_ENGLISH_QUESTION = "What is a variable and how does it work in this course?"
+_ENGLISH_PASSAGE = "The course explains the variable and the value for the students with that example."
+_ARABIC_PASSAGE = "هذا درس طويل عن اللغة العربية في الجامعة ويشرح الفكرة للطلاب بوضوح"
+_ARABIC_QUESTION = "ما هي عاصمة اليابان في هذا السؤال الطويل للطلاب"
+_FRENCH_PASSAGE = "Une variable est un nom qui désigne une valeur dans le cours."
+
+
+def test_french_passage_selects_french() -> None:
+    passage = _passage(_FRENCH_PASSAGE, 5)
+    passage["filename"] = "the-and-of-to-is-for-with-that.pdf"
+    chain, embeddings, _store, llm = _chain([passage])
+
+    result = chain.ask(_ENGLISH_QUESTION)
+    prompt = llm.prompts[0]
+
+    assert "Tu réponds en français" in prompt
+    assert "Answer only in English" not in prompt
+    assert embeddings.questions == [_ENGLISH_QUESTION]
+    assert result["sources"][0]["filename"] == "the-and-of-to-is-for-with-that.pdf"
+    assert result["sources"][0]["page_number"] == 5
+
+
+def test_arabic_passage_selects_arabic() -> None:
+    chain, _embeddings, _store, llm = _chain([_passage(_ARABIC_PASSAGE, 6)])
+
+    chain.ask(_ENGLISH_QUESTION)
+    prompt = llm.prompts[0]
+
+    assert "أجب باللغة العربية فقط" in prompt
+    assert "حسب المستندات" in prompt
+    assert "المعرفة العامة" in prompt
+    assert "Page : 6" in prompt
+    assert "cours_python.pdf" in prompt
+
+
+def test_english_passage_selects_english() -> None:
+    chain, _embeddings, _store, llm = _chain([_passage(_ENGLISH_PASSAGE, 4)])
+
+    chain.ask(_FRENCH_PASSAGE)
+    prompt = llm.prompts[0]
+
+    assert "Answer only in English" in prompt
+    assert "From the documents" in prompt
+    assert "General knowledge" in prompt
+    assert "The information is not available in the documents." in prompt
+    assert "D'après les documents" not in prompt
+
+
+def test_english_majority_selects_english() -> None:
+    passages = [
+        _passage("the " * 40, 1),
+        _passage("and " * 30, 2),
+        _passage("le " * 20, 3),
+    ]
+    chain, _embeddings, _store, llm = _chain(passages)
+
+    chain.ask("Question")
+    prompt = llm.prompts[0]
+
+    assert "Answer only in English" in prompt
+
+
+def test_arabic_majority_selects_arabic() -> None:
+    passages = [
+        _passage("م" * 40, 1),
+        _passage("م" * 40, 2),
+        _passage("le " * 15, 3),
+    ]
+    chain, _embeddings, _store, llm = _chain(passages)
+
+    chain.ask("Question")
+    prompt = llm.prompts[0]
+
+    assert "أجب باللغة العربية فقط" in prompt
+
+
+def test_tie_selects_french() -> None:
+    passages = [
+        _passage("le " * 30, 1),
+        _passage("the " * 20, 2),
+    ]
+    chain, _embeddings, _store, llm = _chain(passages)
+
+    chain.ask("Question")
+    prompt = llm.prompts[0]
+
+    assert "Tu réponds en français" in prompt
+    assert "Answer only in English" not in prompt
+
+
+def test_short_passage_is_ignored() -> None:
+    passage = _passage("Python", 3)
+    chain, embeddings, _store, llm = _chain([passage])
+
+    result = chain.ask(_ENGLISH_QUESTION)
+    prompt = llm.prompts[0]
+
+    assert "Answer only in English" in prompt
+    assert embeddings.questions == [_ENGLISH_QUESTION]
+    assert result["sources"][0]["filename"] == "cours_python.pdf"
+    assert result["sources"][0]["page_number"] == 3
+
+
+def test_english_question_without_passage_selects_english() -> None:
+    chain, embeddings, store, llm = _chain([])
+
+    result = chain.ask(_ENGLISH_QUESTION)
+    prompt = llm.prompts[0]
+
+    assert embeddings.questions == [_ENGLISH_QUESTION]
+    assert store.calls == [([0.2, 0.8], 3)]
+    assert result["sources"] == []
+    assert "Answer only in English" in prompt
+    assert "No passage was found in the documents." in prompt
+
+
+def test_arabic_question_without_passage_selects_arabic() -> None:
+    chain, embeddings, _store, llm = _chain([])
+
+    result = chain.ask(_ARABIC_QUESTION)
+    prompt = llm.prompts[0]
+
+    assert embeddings.questions == [_ARABIC_QUESTION]
+    assert result["sources"] == []
+    assert "أجب باللغة العربية فقط" in prompt
+    assert "لم يُعثر على أي مقطع في المستندات." in prompt
+
+
+def test_short_question_without_passage_selects_french() -> None:
+    chain, _embeddings, _store, llm = _chain([])
+
+    result = chain.ask("Why?")
+    prompt = llm.prompts[0]
+
+    assert result["sources"] == []
+    assert ABSENT_ANSWER in prompt
+    assert "Connaissances générales" in prompt
+    assert "Answer only in English" not in prompt
+
+
+def test_sources_keep_exact_filename_and_page() -> None:
+    passage = _passage(_ENGLISH_PASSAGE, 9)
+    passage["filename"] = "algebre.pdf"
+    chain, _embeddings, _store, llm = _chain([passage])
+
+    result = chain.ask(_ARABIC_QUESTION)
+
+    assert result["sources"] == [
+        {
+            "filename": "algebre.pdf",
+            "page_number": 9,
+            "chunk_id": 3,
+            "text": _ENGLISH_PASSAGE,
+        }
+    ]
+    assert "algebre.pdf" in llm.prompts[0]
+    assert "Page : 9" in llm.prompts[0]
+
+
+def test_original_question_is_vectorized_once_before_language_choice() -> None:
+    chain, embeddings, store, _llm = _chain([_passage(_FRENCH_PASSAGE)])
+
+    chain.ask(_ENGLISH_QUESTION)
+
+    assert embeddings.questions == [_ENGLISH_QUESTION]
+    assert store.calls == [([0.2, 0.8], 3)]
