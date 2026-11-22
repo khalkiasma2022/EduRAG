@@ -47,6 +47,8 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
 
         def generate(self, prompt: str, max_new_tokens: int = 512) -> str:
             self.prompts.append(prompt)
+            if "Réponds par un seul mot" in prompt:
+                return "oui"
             return "Reponse simulee."
 
     monkeypatch.setattr(assistant_module, "EmbeddingModel", FakeEmbeddingModel)
@@ -130,7 +132,7 @@ def test_added_pdf_is_split_and_stored_in_real_faiss(
     assert result["sources"][0]["filename"] == "neurone.pdf"
     assert result["sources"][0]["page_number"] == 1
     assert _NEURONE in result["sources"][0]["text"]
-    prompt = assistant.llm.prompts[0]
+    prompt = assistant.llm.prompts[-1]
     assert "Fichier : neurone.pdf" in prompt
     assert "Page : 1" in prompt
 
@@ -151,8 +153,8 @@ def test_new_assistant_loads_the_saved_faiss_index(
     assert result["sources"][0]["filename"] == "neurone.pdf"
     assert result["sources"][0]["page_number"] == 1
     assert _NEURONE in result["sources"][0]["text"]
-    assert "neurone.pdf" in restarted.llm.prompts[0]
-    assert "Page : 1" in restarted.llm.prompts[0]
+    assert "neurone.pdf" in restarted.llm.prompts[-1]
+    assert "Page : 1" in restarted.llm.prompts[-1]
 
 
 def test_deletion_updates_the_real_index_and_a_restart_finds_nothing(

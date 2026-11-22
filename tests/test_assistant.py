@@ -76,6 +76,8 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
 
         def generate(self, prompt: str, max_new_tokens: int = 512) -> str:
             self.prompts.append(prompt)
+            if "Réponds par un seul mot" in prompt:
+                return "oui"
             return "Réponse de test."
 
     monkeypatch.setattr(assistant_module, "EmbeddingModel", FakeEmbeddingModel)
