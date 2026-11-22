@@ -335,7 +335,7 @@ def test_arabic_passage_selects_arabic() -> None:
     assert "أجب باللغة العربية فقط" in prompt
     assert "حسب المستندات" in prompt
     assert "المعرفة العامة" in prompt
-    assert "Page : 6" in prompt
+    assert "الصفحة : 6" in prompt
     assert "cours_python.pdf" in prompt
 
 
@@ -460,7 +460,8 @@ def test_sources_keep_exact_filename_and_page() -> None:
         }
     ]
     assert "algebre.pdf" in llm.prompts[0]
-    assert "Page : 9" in llm.prompts[0]
+    assert "الصفحة : 9" in llm.prompts[0]
+    assert _ENGLISH_PASSAGE in llm.prompts[0]
 
 
 def test_original_question_is_vectorized_once_before_language_choice() -> None:
@@ -521,6 +522,73 @@ def test_ambiguous_question_follows_english_majority() -> None:
     prompt = llm.prompts[0]
 
     assert "Answer only in English" in prompt
+
+
+@pytest.mark.parametrize(
+    ("passage_text", "question", "reminder"),
+    [
+        (
+            _FRENCH_PASSAGE,
+            "Python",
+            "Réponds entièrement en français. "
+            "La langue des documents récupérés ne doit pas changer la langue de ta réponse.",
+        ),
+        (
+            _ENGLISH_PASSAGE,
+            "Python",
+            "Answer entirely in English. "
+            "The language of the retrieved documents must not change the language of your answer.",
+        ),
+        (
+            _ARABIC_PASSAGE,
+            "Python",
+            "أجب بالكامل باللغة العربية. "
+            "يجب ألا تغيّر لغة المستندات المسترجعة لغة إجابتك.",
+        ),
+    ],
+)
+def test_language_reminder_comes_after_the_pdf_context(passage_text: str, question: str, reminder: str) -> None:
+    chain, _embeddings, _store, llm = _chain([_passage(passage_text, 4)])
+
+    chain.ask(question)
+    prompt = llm.prompts[0]
+
+    assert prompt.index(passage_text) < prompt.index(reminder) < prompt.index(question)
+
+
+def test_passage_labels_follow_the_answer_language() -> None:
+    french_chain, _embeddings, _store, french_llm = _chain([_passage(_FRENCH_PASSAGE, 2)])
+    french_chain.ask("Python")
+    french_prompt = french_llm.prompts[0]
+    assert "Fichier : cours_python.pdf" in french_prompt
+    assert "Page : 2" in french_prompt
+    assert f"Texte : {_FRENCH_PASSAGE}" in french_prompt
+
+    english_chain, _embeddings, _store, english_llm = _chain([_passage(_ENGLISH_PASSAGE, 4)])
+    english_chain.ask("Python")
+    english_prompt = english_llm.prompts[0]
+    assert "File : cours_python.pdf" in english_prompt
+    assert "Page : 4" in english_prompt
+    assert f"Text : {_ENGLISH_PASSAGE}" in english_prompt
+    assert "Fichier :" not in english_prompt
+
+    arabic_chain, _embeddings, _store, arabic_llm = _chain([_passage(_ARABIC_PASSAGE, 6)])
+    arabic_chain.ask("Python")
+    arabic_prompt = arabic_llm.prompts[0]
+    assert "الملف : cours_python.pdf" in arabic_prompt
+    assert "الصفحة : 6" in arabic_prompt
+    assert f"النص : {_ARABIC_PASSAGE}" in arabic_prompt
+
+
+def test_english_example_is_not_the_variable_question() -> None:
+    chain, _embeddings, _store, llm = _chain([_passage(_ENGLISH_PASSAGE)])
+
+    chain.ask("Python")
+    prompt = llm.prompts[0]
+
+    assert "What does photosynthesis produce?" in prompt
+    assert "What is a variable?" not in prompt
+    assert _ENGLISH_PASSAGE in prompt
 
 
 def test_ambiguous_question_without_usable_passage_selects_french() -> None:
