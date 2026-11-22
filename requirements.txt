@@ -1,0 +1,34 @@
+# Environnement EduRAG.
+# Les versions sont figées pour que l'installation reste reproductible.
+# Le pipeline RAG n'est pas encore développé : ces bibliothèques préparent seulement le projet.
+
+# LangChain : orchestration prévue pour les étapes suivantes
+langchain==1.5.2
+
+# Base FAISS au format LangChain. Le paquet langchain ne contient pas cet index.
+langchain-community==0.4.2
+
+# Découpage du texte. LangChain 1.5 fournit ce splitter dans un paquet séparé.
+langchain-text-splitters==1.1.3
+
+# Hugging Face : modèles Transformers et accès au Hub
+transformers==5.24.0
+huggingface-hub==2.4.0
+
+# FAISS : recherche vectorielle locale (paquet officiel faiss-cpu)
+faiss-cpu==1.16.0
+
+# PyPDF : lecture des cours au format PDF
+pypdf==7.1.1
+
+# Streamlit : interface de l'assistant
+streamlit==1.67.0
+
+# Embeddings de phrases
+sentence-transformers==6.3.0
+
+# Chargement des clés depuis le fichier .env
+python-dotenv==1.2.4
+
+# Tests automatisés
+pytest==9.2.0

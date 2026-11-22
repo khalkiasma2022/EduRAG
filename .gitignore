@@ -1,0 +1,39 @@
+# Clés API et fichiers secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+.streamlit/secrets.toml
+.huggingface/
+
+# Documents de cours et index : ils restent sur la machine
+data/documents/*
+!data/documents/.gitkeep
+data/vector_store/*
+!data/vector_store/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Système et éditeurs
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
