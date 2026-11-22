@@ -2,7 +2,7 @@
 
 Les trois composants sont fournis déjà initialisés.
 Ce module ne recharge ni le modèle d'embeddings, ni l'index, ni le LLM.
-La langue de la réponse est déduite du texte des passages, sans modèle supplémentaire.
+La langue de la réponse suit d'abord la question, puis les passages si elle est ambiguë.
 """
 
 import re
@@ -197,7 +197,7 @@ class RAGChain:
             context = _context_for_prompt(sources)
         else:
             context = ""
-        # La langue se décide après la recherche, sans modifier la question.
+        # La question claire choisit la langue. Sinon, les passages votent.
         language = _response_language(sources, question)
         if not sources:
             context = _LANGUAGE_PROMPTS[language]["no_passage"]
@@ -312,10 +312,16 @@ def _build_context(sources: list[dict[str, str | int]]) -> str:
 
 
 def _response_language(sources: list[dict[str, str | int]], question: str) -> str:
-    """Choisit fr, ar ou en à partir des passages, sinon à partir de la question.
+    """Choisit fr, ar ou en.
 
-    Seul le texte vote. Le nom du fichier et la page ne comptent pas.
+    Une question claire l'emporte sur les passages. Si elle est trop courte
+    ou ambiguë, la langue majoritaire des passages est utilisée. Sinon, le français.
+    Le nom du fichier et la page ne comptent pas.
     """
+    question_language = _detect_language(question)
+    if question_language is not None:
+        return question_language
+
     totals = {"fr": 0, "ar": 0, "en": 0}
     for source in sources:
         detected = _detect_language(str(source["text"]))
@@ -324,8 +330,7 @@ def _response_language(sources: list[dict[str, str | int]], question: str) -> st
         totals[detected] += _letter_count(str(source["text"]))
 
     if sum(totals.values()) == 0:
-        detected = _detect_language(question)
-        return detected if detected is not None else "fr"
+        return "fr"
 
     best = max(totals.values())
     leaders = [language for language, count in totals.items() if count == best]

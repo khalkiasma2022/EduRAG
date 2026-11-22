@@ -316,12 +316,12 @@ def test_french_passage_selects_french() -> None:
     passage["filename"] = "the-and-of-to-is-for-with-that.pdf"
     chain, embeddings, _store, llm = _chain([passage])
 
-    result = chain.ask(_ENGLISH_QUESTION)
+    result = chain.ask("Question")
     prompt = llm.prompts[0]
 
     assert "Tu réponds en français" in prompt
     assert "Answer only in English" not in prompt
-    assert embeddings.questions == [_ENGLISH_QUESTION]
+    assert embeddings.questions == ["Question"]
     assert result["sources"][0]["filename"] == "the-and-of-to-is-for-with-that.pdf"
     assert result["sources"][0]["page_number"] == 5
 
@@ -329,7 +329,7 @@ def test_french_passage_selects_french() -> None:
 def test_arabic_passage_selects_arabic() -> None:
     chain, _embeddings, _store, llm = _chain([_passage(_ARABIC_PASSAGE, 6)])
 
-    chain.ask(_ENGLISH_QUESTION)
+    chain.ask("Question")
     prompt = llm.prompts[0]
 
     assert "أجب باللغة العربية فقط" in prompt
@@ -342,7 +342,7 @@ def test_arabic_passage_selects_arabic() -> None:
 def test_english_passage_selects_english() -> None:
     chain, _embeddings, _store, llm = _chain([_passage(_ENGLISH_PASSAGE, 4)])
 
-    chain.ask(_FRENCH_PASSAGE)
+    chain.ask("Question")
     prompt = llm.prompts[0]
 
     assert "Answer only in English" in prompt
@@ -470,3 +470,67 @@ def test_original_question_is_vectorized_once_before_language_choice() -> None:
 
     assert embeddings.questions == [_ENGLISH_QUESTION]
     assert store.calls == [([0.2, 0.8], 3)]
+
+
+def test_english_question_overrides_french_passages() -> None:
+    chain, embeddings, _store, llm = _chain([_passage(_FRENCH_PASSAGE, 2)])
+
+    result = chain.ask(_ENGLISH_QUESTION)
+    prompt = llm.prompts[0]
+
+    assert "Answer only in English" in prompt
+    assert "Tu réponds en français" not in prompt
+    assert embeddings.questions == [_ENGLISH_QUESTION]
+    assert result["sources"][0]["filename"] == "cours_python.pdf"
+    assert result["sources"][0]["page_number"] == 2
+
+
+def test_french_question_overrides_english_passages() -> None:
+    chain, _embeddings, _store, llm = _chain([_passage(_ENGLISH_PASSAGE, 4)])
+
+    result = chain.ask(_FRENCH_PASSAGE)
+    prompt = llm.prompts[0]
+
+    assert "Tu réponds en français" in prompt
+    assert "Answer only in English" not in prompt
+    assert result["sources"][0]["page_number"] == 4
+    assert result["sources"][0]["text"] == _ENGLISH_PASSAGE
+
+
+def test_arabic_question_overrides_french_passages() -> None:
+    chain, _embeddings, _store, llm = _chain([_passage(_FRENCH_PASSAGE, 8)])
+
+    result = chain.ask(_ARABIC_QUESTION)
+    prompt = llm.prompts[0]
+
+    assert "أجب باللغة العربية فقط" in prompt
+    assert "Tu réponds en français" not in prompt
+    assert result["sources"][0]["filename"] == "cours_python.pdf"
+    assert result["sources"][0]["page_number"] == 8
+
+
+def test_ambiguous_question_follows_english_majority() -> None:
+    passages = [
+        _passage("the " * 40, 1),
+        _passage("and " * 30, 2),
+        _passage("le " * 20, 3),
+    ]
+    chain, _embeddings, _store, llm = _chain(passages)
+
+    chain.ask("Python")
+    prompt = llm.prompts[0]
+
+    assert "Answer only in English" in prompt
+
+
+def test_ambiguous_question_without_usable_passage_selects_french() -> None:
+    chain, _embeddings, _store, llm = _chain([_passage("Python", 1)])
+
+    result = chain.ask("Why?")
+    prompt = llm.prompts[0]
+
+    assert result["sources"][0]["filename"] == "cours_python.pdf"
+    assert result["sources"][0]["page_number"] == 1
+    assert ABSENT_ANSWER in prompt
+    assert "Connaissances générales" in prompt
+    assert "Answer only in English" not in prompt
