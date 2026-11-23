@@ -5,7 +5,7 @@ Cette page présente le projet, les cours, l'ajout d'un PDF et les fiches enregi
 """
 
 import tempfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import streamlit as st
 
@@ -38,8 +38,9 @@ def _store_uploaded_pdf(assistant: EduRAGAssistant, uploaded: object) -> dict[st
     """Copie le PDF hors de la bibliothèque, puis le fait enregistrer.
 
     Le fichier temporaire est supprimé même si l'ajout échoue.
+    Le nom est réduit au fichier : « / » et « \\ » sont retirés sous Windows et Linux.
     """
-    name = Path(str(getattr(uploaded, "name", ""))).name
+    name = PureWindowsPath(str(getattr(uploaded, "name", ""))).name
     if name in {"", ".", ".."} or not name.lower().endswith(".pdf"):
         raise ValueError("Le fichier sélectionné doit être un PDF.")
 

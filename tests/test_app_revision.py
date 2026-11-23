@@ -4,6 +4,7 @@ Ils utilisent un faux assistant et des fichiers temporaires.
 Ils n'appellent pas get_assistant() et ne chargent aucun modèle.
 """
 
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,9 @@ class _Assistant:
         path = Path(file_path)
         self.paths.append(path)
         assert path.is_file()
+        assert "\\" not in path.name and "/" not in path.name
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        assert path.resolve().parent.parent == temp_root
         assert _DOCUMENTS.resolve() not in path.resolve().parents
         if path.read_bytes() == b"bad":
             raise ValueError("Ce document est déjà dans la bibliothèque.")
@@ -147,6 +151,31 @@ def test_uploaded_pdf_is_removed_when_add_pdf_fails() -> None:
     with pytest.raises(ValueError, match="déjà"):
         app_module._store_uploaded_pdf(assistant, _Upload(r"..\secret.pdf", b"bad"))
 
+    assert assistant.paths[0].name == "secret.pdf"
+    assert not assistant.paths[0].exists()
+    assert not assistant.paths[0].parent.exists()
+
+
+@pytest.mark.parametrize(
+    "uploaded_name",
+    [
+        "secret.pdf",
+        r"..\secret.pdf",
+        r".\secret.pdf",
+        "../secret.pdf",
+        "./secret.pdf",
+        "dossier/secret.pdf",
+        r"dossier\secret.pdf",
+        r"C:\Users\eleve\secret.pdf",
+        "/tmp/dossier/secret.pdf",
+    ],
+)
+def test_uploaded_pdf_name_is_portable_across_windows_and_linux(uploaded_name: str) -> None:
+    assistant = _Assistant()
+
+    added = app_module._store_uploaded_pdf(assistant, _Upload(uploaded_name, b"%PDF-1.4"))
+
+    assert added["filename"] == "secret.pdf"
     assert assistant.paths[0].name == "secret.pdf"
     assert not assistant.paths[0].exists()
     assert not assistant.paths[0].parent.exists()
