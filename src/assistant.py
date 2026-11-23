@@ -1,7 +1,7 @@
 """Objet central d'EduRAG.
 
 Il crée les modèles une seule fois, puis les partage
-entre la bibliothèque de PDF et la chaîne de réponse.
+entre la bibliothèque de PDF, la chaîne de réponse et les fiches.
 """
 
 from pathlib import Path
@@ -15,6 +15,9 @@ from src.retrieval.vector_store import (
     _directory_to_load,
     _require_trusted_manifest,
 )
+from src.revision.export import RevisionExport
+from src.revision.sheet import RevisionSheet
+from src.revision.store import RevisionStore
 
 
 class EduRAGAssistant:
@@ -24,10 +27,13 @@ class EduRAGAssistant:
         self,
         documents_directory: str | Path,
         index_directory: str | Path,
+        revision_database_path: str | Path | None = None,
     ) -> None:
         """Crée les composants, puis ouvre ou reconstruit l'index si besoin."""
         self.documents_directory = Path(documents_directory).resolve()
         self.index_directory = Path(index_directory).resolve()
+        if revision_database_path is None:
+            revision_database_path = self.documents_directory / "revisions.sqlite"
 
         # Une seule création : les mêmes objets sont ensuite réutilisés.
         self.embedding_model = EmbeddingModel()
@@ -44,7 +50,48 @@ class EduRAGAssistant:
             self.vector_store,
             self.llm,
         )
+        self.revision_sheet = RevisionSheet(self.library, self.llm)
+        self.revision_store = RevisionStore(revision_database_path)
+        self.revision_export = RevisionExport()
         self._open_existing_index()
+
+    def create_revision(
+        self,
+        document_id: str,
+        page_start: int | None = None,
+        page_end: int | None = None,
+        language: str = "fr",
+        level: str = "beginner",
+        sheet_type: str = "complete",
+    ) -> dict[str, str | int]:
+        """Produit une fiche avec le modèle déjà chargé, puis l'enregistre."""
+        generated = self.revision_sheet.generate(
+            document_id,
+            page_start=page_start,
+            page_end=page_end,
+            language=language,
+            level=level,
+            sheet_type=sheet_type,
+        )
+        return self.revision_store.save(generated)
+
+    def list_revisions(self) -> list[dict[str, str | int]]:
+        """Retourne les fiches enregistrées, de la plus récente à la plus ancienne."""
+        return self.revision_store.list_sheets()
+
+    def get_revision(self, sheet_id: object) -> dict[str, str | int]:
+        """Retrouve une fiche enregistrée, même si son PDF a quitté la bibliothèque."""
+        return self.revision_store.get(sheet_id)
+
+    def export_revision_markdown(self, sheet_id: object, output_path: str | Path) -> Path:
+        """Écrit une fiche déjà enregistrée en Markdown."""
+        sheet = self.get_revision(sheet_id)
+        return self.revision_export.export_markdown(sheet, output_path)
+
+    def export_revision_pdf(self, sheet_id: object, output_path: str | Path) -> Path:
+        """Écrit une fiche déjà enregistrée en PDF."""
+        sheet = self.get_revision(sheet_id)
+        return self.revision_export.export_pdf(sheet, output_path)
 
     def add_pdf(self, file_path: str | Path) -> dict[str, str]:
         """Ajoute un PDF avec la bibliothèque déjà ouverte."""

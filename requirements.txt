@@ -21,6 +21,10 @@ faiss-cpu==1.16.0
 # PyPDF : lecture des cours au format PDF
 pypdf==7.1.1
 
+# Export PDF des fiches : mise en page et façonnage des lettres arabes
+fpdf2==2.9.0
+uharfbuzz==0.57.0
+
 # Streamlit : interface de l'assistant
 streamlit==1.67.0
 

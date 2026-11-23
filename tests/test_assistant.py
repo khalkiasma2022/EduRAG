@@ -8,12 +8,15 @@ import json
 from pathlib import Path
 
 import pytest
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from src.generation.rag_chain import RAGChain
 from src.ingestion.library import DocumentLibrary
 from src.retrieval.vector_store import MANIFEST_NAME
+from src.revision.export import RevisionExport
+from src.revision.sheet import RevisionSheet
+from src.revision.store import RevisionStore
 
 import src.assistant as assistant_module
 
@@ -46,6 +49,7 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
             self.embedding_model = embedding_model
             self.chunks: list[dict] = []
             self.loaded: list[Path] = []
+            self.search_calls = 0
 
         def create(self, chunks: list[dict], embeddings: list[list[float]]) -> None:
             self.chunks = [dict(chunk) for chunk in chunks]
@@ -63,6 +67,7 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
             self.loaded.append(Path(directory))
 
         def search_by_vector(self, vector: list[float], top_k: int = 3) -> list[dict]:
+            self.search_calls += 1
             if not self.chunks:
                 raise ValueError("Impossible de rechercher dans une base vide.")
             return self.chunks[:top_k]
@@ -159,6 +164,45 @@ def test_creates_each_component_once(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert assistant.embedding_model is created["embedding"][0]
     assert assistant.vector_store is created["store"][0]
     assert assistant.llm is created["llm"][0]
+
+
+def test_revision_components_share_the_library_and_the_llm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, created = _assistant(tmp_path, monkeypatch)
+    database = (tmp_path / "documents").resolve() / "revisions.sqlite"
+
+    assert isinstance(assistant.revision_sheet, RevisionSheet)
+    assert isinstance(assistant.revision_store, RevisionStore)
+    assert isinstance(assistant.revision_export, RevisionExport)
+    assert assistant.revision_sheet.library is assistant.library
+    assert assistant.revision_sheet.llm is assistant.llm
+    assert assistant.revision_sheet.llm is created["llm"][0]
+    assert assistant.revision_store.path == database
+    assert database.is_file()
+    assert len(created["embedding"]) == 1
+    assert len(created["llm"]) == 1
+
+
+def test_revision_database_path_can_be_chosen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = _install_fakes(monkeypatch)
+    database = tmp_path / "bases" / "fiches.sqlite"
+
+    assistant = assistant_module.EduRAGAssistant(
+        tmp_path / "documents",
+        tmp_path / "index",
+        database,
+    )
+
+    assert assistant.revision_store.path == database
+    assert database.is_file()
+    assert not ((tmp_path / "documents").resolve() / "revisions.sqlite").exists()
+    assert len(created["embedding"]) == 1
+    assert len(created["llm"]) == 1
+    assert assistant.revision_sheet.library is assistant.library
+    assert assistant.revision_sheet.llm is assistant.llm
 
 
 def test_library_and_chain_share_the_vector_store(
@@ -287,3 +331,350 @@ def test_remove_document_uses_the_same_library(
     assistant.remove_document(added["document_id"])
 
     assert assistant.list_documents() == []
+
+
+class _RevisionTokenIds:
+    """Imite le tenseur lu par le contrôle de longueur."""
+
+    def __init__(self, count: int) -> None:
+        self.shape = (1, count)
+
+
+class _RevisionTokenizer:
+    """Compte un prompt court sans télécharger le tokenizer de Qwen."""
+
+    def __init__(self) -> None:
+        self.chat_template = None
+
+    def __call__(self, prompt: str, return_tensors: str = "pt") -> dict[str, _RevisionTokenIds]:
+        return {"input_ids": _RevisionTokenIds(4)}
+
+
+class _RevisionConfig:
+    """Expose une limite large et un RoPE standard."""
+
+    def __init__(self) -> None:
+        self.max_position_embeddings = 8192
+        self.rope_parameters = {"rope_type": "default"}
+        self.use_sliding_window = False
+
+
+def _arm_revision_model(llm: object) -> None:
+    """Rend le faux Qwen déjà chargé, sans créer un second modèle."""
+    llm.tokenizer = _RevisionTokenizer()
+    llm.model = type("RevisionModel", (), {"config": _RevisionConfig()})()
+    llm.is_loaded = lambda: True
+
+
+def test_create_revision_saves_one_sheet_without_searching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, created = _assistant(tmp_path, monkeypatch)
+    source = _write_text_pdf(tmp_path / "cours.pdf", ["Page un", "Page deux", "Page trois"])
+    added = assistant.add_pdf(source)
+    _arm_revision_model(assistant.llm)
+    generate_calls: list[dict[str, object]] = []
+    original_generate = assistant.revision_sheet.generate
+
+    def spy_generate(
+        document_id: str,
+        page_start: int | None = None,
+        page_end: int | None = None,
+        language: str = "fr",
+        level: str = "beginner",
+        sheet_type: str = "complete",
+    ) -> dict[str, str | int]:
+        generate_calls.append(
+            {
+                "document_id": document_id,
+                "page_start": page_start,
+                "page_end": page_end,
+                "language": language,
+                "level": level,
+                "sheet_type": sheet_type,
+            }
+        )
+        return original_generate(
+            document_id,
+            page_start=page_start,
+            page_end=page_end,
+            language=language,
+            level=level,
+            sheet_type=sheet_type,
+        )
+
+    assistant.revision_sheet.generate = spy_generate
+    ask_calls: list[tuple] = []
+    original_ask = assistant.rag_chain.ask
+
+    def spy_ask(*args: object, **kwargs: object) -> dict:
+        ask_calls.append((args, kwargs))
+        return original_ask(*args, **kwargs)
+
+    assistant.rag_chain.ask = spy_ask
+    queries_before = assistant.embedding_model.query_calls
+    chunks_before = assistant.embedding_model.embed_chunk_calls
+    searches_before = assistant.vector_store.search_calls
+
+    saved = assistant.create_revision(
+        added["document_id"],
+        page_start=2,
+        page_end=3,
+        language="en",
+        level="advanced",
+        sheet_type="short",
+    )
+
+    assert generate_calls == [
+        {
+            "document_id": added["document_id"],
+            "page_start": 2,
+            "page_end": 3,
+            "language": "en",
+            "level": "advanced",
+            "sheet_type": "short",
+        }
+    ]
+    assert isinstance(saved["id"], int) and saved["id"] > 0
+    assert isinstance(saved["created_at"], str) and saved["created_at"].strip() != ""
+    assert saved["content"] == "Réponse de test."
+    assert saved["document_id"] == added["document_id"]
+    assert saved["filename"] == "cours.pdf"
+    assert saved["page_start"] == 2
+    assert saved["page_end"] == 3
+    assert saved["language"] == "en"
+    assert saved["level"] == "advanced"
+    assert saved["sheet_type"] == "short"
+    assert assistant.revision_store.get(saved["id"]) == saved
+    assert ask_calls == []
+    assert assistant.embedding_model.query_calls == queries_before
+    assert assistant.embedding_model.embed_chunk_calls == chunks_before
+    assert assistant.vector_store.search_calls == searches_before
+    assert len(created["llm"]) == 1
+    assert len(created["embedding"]) == 1
+    assert len(created["store"]) == 1
+    assert assistant.revision_sheet.llm is assistant.llm
+
+
+def test_create_revision_does_not_save_when_generation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="introuvable"):
+        assistant.create_revision("document-absent")
+
+    assert assistant.revision_store.list_sheets() == []
+
+    def fail_generation(*args: object, **kwargs: object) -> dict[str, str | int]:
+        raise RuntimeError("La génération a échoué.")
+
+    assistant.revision_sheet.generate = fail_generation
+
+    with pytest.raises(RuntimeError, match="La génération a échoué"):
+        assistant.create_revision("doc-python", page_start=1, page_end=1)
+
+    assert assistant.revision_store.list_sheets() == []
+
+
+def _forbid_model_use(assistant: assistant_module.EduRAGAssistant) -> dict[str, int]:
+    """Mémorise l'activité des modèles, puis refuse tout nouvel appel."""
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("La consultation ne doit pas interroger les modèles.")
+
+    assistant.revision_sheet.generate = forbidden
+    assistant.rag_chain.ask = forbidden
+    assistant.embedding_model.embed_query = forbidden
+    assistant.embedding_model.embed_chunks = forbidden
+    assistant.vector_store.search_by_vector = forbidden
+    return {
+        "prompts": len(assistant.llm.prompts),
+        "queries": assistant.embedding_model.query_calls,
+        "chunks": assistant.embedding_model.embed_chunk_calls,
+        "searches": assistant.vector_store.search_calls,
+    }
+
+
+def test_list_and_get_revision_return_saved_sheets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, created = _assistant(tmp_path, monkeypatch)
+    assert assistant.list_revisions() == []
+    source = _write_text_pdf(tmp_path / "cours.pdf", ["Page un", "Page deux", "Page trois"])
+    added = assistant.add_pdf(source)
+    _arm_revision_model(assistant.llm)
+    first = assistant.create_revision(
+        added["document_id"],
+        page_start=1,
+        page_end=1,
+        language="fr",
+        level="beginner",
+        sheet_type="short",
+    )
+    second = assistant.create_revision(
+        added["document_id"],
+        page_start=2,
+        page_end=3,
+        language="en",
+        level="advanced",
+        sheet_type="complete",
+    )
+    before = _forbid_model_use(assistant)
+
+    listed = assistant.list_revisions()
+    found = assistant.get_revision(first["id"])
+
+    assert listed == [second, first]
+    assert found == first
+    assert found["document_id"] == added["document_id"]
+    assert found["filename"] == "cours.pdf"
+    assert found["page_start"] == 1
+    assert found["page_end"] == 1
+    assert found["language"] == "fr"
+    assert found["level"] == "beginner"
+    assert found["sheet_type"] == "short"
+    assert found["content"] == "Réponse de test."
+    assert found["created_at"]
+    assert len(assistant.llm.prompts) == before["prompts"]
+    assert assistant.embedding_model.query_calls == before["queries"]
+    assert assistant.embedding_model.embed_chunk_calls == before["chunks"]
+    assert assistant.vector_store.search_calls == before["searches"]
+    assert len(created["llm"]) == 1
+    assert len(created["embedding"]) == 1
+
+
+@pytest.mark.parametrize("sheet_id", [0, -1, True, "1", None])
+def test_get_revision_rejects_an_invalid_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sheet_id: object
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    before = _forbid_model_use(assistant)
+
+    with pytest.raises(ValueError, match="invalide"):
+        assistant.get_revision(sheet_id)
+
+    assert assistant.list_revisions() == []
+    assert len(assistant.llm.prompts) == before["prompts"]
+
+
+def test_get_revision_rejects_an_unknown_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="introuvable"):
+        assistant.get_revision(4)
+
+    assert assistant.list_revisions() == []
+
+
+def test_get_revision_keeps_a_sheet_after_the_pdf_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    source = _write_text_pdf(tmp_path / "cours.pdf", ["Page un"])
+    added = assistant.add_pdf(source)
+    _arm_revision_model(assistant.llm)
+    saved = assistant.create_revision(added["document_id"], language="ar", level="intermediate")
+
+    assistant.remove_document(added["document_id"])
+    before = _forbid_model_use(assistant)
+
+    assert assistant.list_documents() == []
+    assert assistant.get_revision(saved["id"]) == saved
+    assert assistant.list_revisions() == [saved]
+    assert len(assistant.llm.prompts) == before["prompts"]
+    assert assistant.embedding_model.query_calls == before["queries"]
+    assert assistant.embedding_model.embed_chunk_calls == before["chunks"]
+    assert assistant.vector_store.search_calls == before["searches"]
+
+
+def _spy_export(exporter: RevisionExport, method_name: str) -> list[tuple[object, object]]:
+    """Enregistre les appels, puis laisse l'exporteur réel écrire le fichier."""
+    calls: list[tuple[object, object]] = []
+    original = getattr(exporter, method_name)
+
+    def spy(sheet: object, output_path: object) -> Path:
+        calls.append((sheet, output_path))
+        return original(sheet, output_path)
+
+    setattr(exporter, method_name, spy)
+    return calls
+
+
+def test_export_revision_writes_markdown_and_pdf_from_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    source = _write_text_pdf(tmp_path / "cours.pdf", ["Page un"])
+    added = assistant.add_pdf(source)
+    _arm_revision_model(assistant.llm)
+    saved = assistant.create_revision(
+        added["document_id"],
+        page_start=1,
+        page_end=1,
+        language="fr",
+        level="beginner",
+        sheet_type="complete",
+    )
+    markdown_path = tmp_path / "exports" / "fiche.md"
+    pdf_path = tmp_path / "exports" / "fiche.pdf"
+    before = _forbid_model_use(assistant)
+    markdown_calls = _spy_export(assistant.revision_export, "export_markdown")
+    pdf_calls = _spy_export(assistant.revision_export, "export_pdf")
+
+    written_markdown = assistant.export_revision_markdown(saved["id"], markdown_path)
+    written_pdf = assistant.export_revision_pdf(saved["id"], pdf_path)
+
+    markdown = markdown_path.read_text(encoding="utf-8")
+    pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(pdf_path).pages)
+    assert written_markdown == markdown_path
+    assert markdown_path.is_file()
+    assert saved["content"] in markdown
+    assert saved["filename"] in markdown
+    assert saved["created_at"] in markdown
+    assert "Français" in markdown
+    assert "Débutant" in markdown
+    assert "Fiche complète" in markdown
+    assert markdown_calls == [(saved, markdown_path)]
+    assert written_pdf == pdf_path
+    assert pdf_path.read_bytes().startswith(b"%PDF")
+    assert pdf_path.stat().st_size > 0
+    assert saved["content"] in pdf_text
+    assert saved["filename"] in pdf_text
+    assert saved["created_at"] in pdf_text
+    assert "Français" in pdf_text
+    assert "Débutant" in pdf_text
+    assert "Fiche complète" in pdf_text
+    assert pdf_calls == [(saved, pdf_path)]
+    assert len(assistant.llm.prompts) == before["prompts"]
+    assert assistant.embedding_model.query_calls == before["queries"]
+    assert assistant.embedding_model.embed_chunk_calls == before["chunks"]
+    assert assistant.vector_store.search_calls == before["searches"]
+
+
+@pytest.mark.parametrize("sheet_id,message", [(0, "invalide"), (4, "introuvable")])
+def test_export_revision_rejects_a_bad_sheet_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sheet_id: object,
+    message: str,
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    markdown_path = tmp_path / "fiche.md"
+    pdf_path = tmp_path / "fiche.pdf"
+    before = _forbid_model_use(assistant)
+    markdown_calls = _spy_export(assistant.revision_export, "export_markdown")
+    pdf_calls = _spy_export(assistant.revision_export, "export_pdf")
+
+    with pytest.raises(ValueError, match=message):
+        assistant.export_revision_markdown(sheet_id, markdown_path)
+    with pytest.raises(ValueError, match=message):
+        assistant.export_revision_pdf(sheet_id, pdf_path)
+
+    assert not markdown_path.exists()
+    assert not pdf_path.exists()
+    assert markdown_calls == []
+    assert pdf_calls == []
+    assert len(assistant.llm.prompts) == before["prompts"]

@@ -54,6 +54,8 @@ EXPECTED_PACKAGES = {
     "huggingface-hub",
     "faiss-cpu",
     "pypdf",
+    "fpdf2",
+    "uharfbuzz",
     "streamlit",
     "sentence-transformers",
     "python-dotenv",
