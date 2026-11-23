@@ -1,7 +1,7 @@
-"""Accueil Streamlit d'EduRAG.
+"""Interface Streamlit d'EduRAG.
 
 Une seule instance d'EduRAGAssistant est créée, puis réutilisée.
-Cette page présente le projet, les cours, l'ajout d'un PDF et les fiches enregistrées.
+La page centrale est la conversation. Les cours et les fiches restent accessibles à part.
 """
 
 import tempfile
@@ -16,6 +16,12 @@ _DOCUMENTS = _ROOT / "data" / "documents"
 _INDEX = _ROOT / "data" / "vector_store"
 _REVISION_ID = "revision_id"
 _OPENED_REVISION_ID = "opened_revision_id"
+_CONVERSATION_ID = "conversation_id"
+_SCREEN = "screen"
+_CHAT_ERROR = "chat_error"
+_CHAT_SCREEN = "chat"
+_COURSES_SCREEN = "courses"
+_TITLE_LIMIT = 80
 _LANGUAGES = (("Français", "fr"), ("Anglais", "en"), ("Arabe", "ar"))
 _LEVELS = (
     ("Débutant", "beginner"),
@@ -194,41 +200,213 @@ def _offer_downloads(assistant: EduRAGAssistant, sheet_id: object, section: str)
     )
 
 
-def _choice(label: str, options: tuple[tuple[str, str], ...]) -> str:
-    """Affiche un libellé et renvoie la valeur interne correspondante."""
-    labels = [item[0] for item in options]
-    selected = st.selectbox(label, labels)
-    return dict(options)[selected]
+def _begin_new_conversation(state: dict[str, object]) -> None:
+    """Ouvre une conversation vide. La base n'est créée qu'à la première question."""
+    state[_CONVERSATION_ID] = None
+    state[_SCREEN] = _CHAT_SCREEN
 
 
-def main() -> None:
-    """Affiche l'accueil, les cours et le formulaire de fiche."""
-    st.set_page_config(
-        page_title="EduRAG",
-        page_icon="📚",
-        layout="centered",
-    )
-    st.title("EduRAG")
-    st.subheader("Assistant éducatif à partir de vos cours PDF")
+def _select_conversation(state: dict[str, object], conversation_id: object) -> None:
+    """Retient l'identifiant SQLite de la conversation à afficher."""
+    state[_CONVERSATION_ID] = conversation_id
+    state[_SCREEN] = _CHAT_SCREEN
+
+
+def _show_courses(state: dict[str, object]) -> None:
+    """Affiche les cours et les fiches, sans fermer la conversation retenue."""
+    state[_SCREEN] = _COURSES_SCREEN
+
+
+def _conversation_title(question: str) -> str:
+    """Résume la première question pour le titre enregistré."""
+    if not isinstance(question, str):
+        raise ValueError("La question ne peut pas être vide.")
+    title = " ".join(question.split())
+    if title == "":
+        raise ValueError("La question ne peut pas être vide.")
+    if len(title) <= _TITLE_LIMIT:
+        return title
+    return title[: _TITLE_LIMIT - 1].rstrip() + "…"
+
+
+def _submit_chat(
+    assistant: EduRAGAssistant,
+    state: dict[str, object],
+    question: str,
+) -> dict[str, str | int | dict]:
+    """Envoie une question. Une conversation nouvelle n'appelle send_message qu'une fois."""
+    conversation_id = state.get(_CONVERSATION_ID)
+    if conversation_id is None:
+        conversation_id = assistant.create_conversation(_conversation_title(question))
+        state[_CONVERSATION_ID] = conversation_id
+    return assistant.send_message(conversation_id, question)
+
+
+def _load_conversation(
+    assistant: EduRAGAssistant,
+    conversation_id: object,
+) -> dict[str, str | int | list]:
+    """Relit une conversation enregistrée, sans produire de nouvelle réponse."""
+    return assistant.get_conversation(conversation_id)
+
+
+def _delete_conversation(
+    assistant: EduRAGAssistant,
+    state: dict[str, object],
+    conversation_id: object,
+) -> None:
+    """Supprime une conversation. L'écran redevient vide si c'était la conversation ouverte."""
+    assistant.delete_conversation(conversation_id)
+    if state.get(_CONVERSATION_ID) == conversation_id:
+        state[_CONVERSATION_ID] = None
+
+
+def _conversation_entries(
+    conversations: list[dict[str, str | int]],
+    current_id: object,
+) -> list[dict[str, str | int | bool]]:
+    """Garde l'ordre reçu et marque la conversation ouverte par son identifiant."""
+    return [
+        {
+            "id": conversation["id"],
+            "title": str(conversation["title"]),
+            "current": conversation["id"] == current_id,
+        }
+        for conversation in conversations
+    ]
+
+
+def _format_message_sources(sources: object) -> str:
+    """Cite le fichier et la page, sans le texte du passage ni son identifiant interne."""
+    if not isinstance(sources, list):
+        return ""
+    parts: list[str] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        filename = source.get("filename")
+        page_number = source.get("page_number")
+        if not isinstance(filename, str) or filename.strip() == "":
+            continue
+        if isinstance(page_number, bool) or not isinstance(page_number, int):
+            continue
+        parts.append(f"{filename.strip()}, page {page_number}")
+    return " · ".join(parts)
+
+
+def _remove_course(assistant: EduRAGAssistant, document_id: str) -> None:
+    """Retire un cours de la bibliothèque déjà ouverte."""
+    assistant.remove_document(document_id)
+
+
+def _apply_layout() -> None:
+    """Limite la largeur de lecture sans rétrécir la barre latérale."""
     st.markdown(
         """
-        EduRAG s'appuie sur les PDF que vous enregistrez.
-        Les réponses et les fiches restent liées à ces cours.
-
-        **Smart Revision** crée une fiche de révision à partir d'un cours.
-
-        **Smart Practice** est prévu pour s'entraîner sur les cours.
-        Il n'est pas encore disponible.
-
-        **AI Tutor** peut déjà répondre à une question sur un cours
-        dans le moteur EduRAG. Cette page n'a pas encore de zone de dialogue.
-
-        Langues prises en charge : français, anglais et arabe.
-        """
+        <style>
+        section.main > div.block-container {
+            max-width: 860px;
+            padding-top: 1.5rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    with st.spinner("Ouverture de l'assistant…"):
-        assistant = get_assistant()
+
+def _render_sidebar(assistant: EduRAGAssistant) -> None:
+    """Affiche les conversations et l'accès aux cours."""
+    st.sidebar.header("EduRAG")
+    if st.sidebar.button("+ Nouvelle conversation", use_container_width=True):
+        _begin_new_conversation(st.session_state)
+        st.rerun()
+
+    conversations = assistant.list_conversations()
+    current_id = st.session_state.get(_CONVERSATION_ID)
+    if not conversations:
+        st.sidebar.caption("Aucune conversation pour le moment.")
+    for entry in _conversation_entries(conversations, current_id):
+        title_column, delete_column = st.sidebar.columns([5, 1], vertical_alignment="center")
+        button_type = "primary" if entry["current"] else "secondary"
+        if title_column.button(
+            str(entry["title"]),
+            key=f"open_{entry['id']}",
+            type=button_type,
+            use_container_width=True,
+        ):
+            _select_conversation(st.session_state, entry["id"])
+            st.rerun()
+        if delete_column.button(
+            "✕",
+            key=f"delete_{entry['id']}",
+            help="Supprimer cette conversation",
+        ):
+            try:
+                _delete_conversation(assistant, st.session_state, entry["id"])
+            except (ValueError, RuntimeError) as error:
+                st.sidebar.error(str(error))
+            else:
+                st.rerun()
+
+    st.sidebar.divider()
+    if st.sidebar.button("Cours et fiches", use_container_width=True):
+        _show_courses(st.session_state)
+        st.rerun()
+
+
+def _render_messages(messages: list[dict[str, str | int | list]]) -> None:
+    """Affiche les messages déjà enregistrés."""
+    for message in messages:
+        role = str(message.get("role"))
+        if role not in {"user", "assistant"}:
+            role = "assistant"
+        with st.chat_message(role):
+            st.markdown(str(message.get("content", "")))
+            sources = _format_message_sources(message.get("sources"))
+            if sources:
+                st.caption(f"Sources : {sources}")
+
+
+def _render_chat(assistant: EduRAGAssistant) -> None:
+    """Affiche la conversation ouverte, puis envoie une nouvelle question."""
+    conversation_id = st.session_state.get(_CONVERSATION_ID)
+    if conversation_id is None:
+        st.title("EduRAG")
+        st.markdown(
+            "Posez une question sur vos cours PDF. "
+            "La réponse peut citer le fichier et la page. "
+            "Français, anglais et arabe sont pris en charge."
+        )
+    else:
+        try:
+            conversation = _load_conversation(assistant, conversation_id)
+        except (ValueError, RuntimeError) as error:
+            st.session_state[_CONVERSATION_ID] = None
+            st.error(str(error))
+        else:
+            st.subheader(str(conversation["title"]))
+            messages = conversation.get("messages")
+            if isinstance(messages, list):
+                _render_messages(messages)
+
+    error = st.session_state.pop(_CHAT_ERROR, None)
+    if isinstance(error, str) and error.strip() != "":
+        st.error(error)
+
+    question = st.chat_input("Posez une question sur vos cours")
+    if not question:
+        return
+    try:
+        with st.spinner("Génération de la réponse…"):
+            _submit_chat(assistant, st.session_state, question)
+    except (OSError, ValueError, RuntimeError) as error:
+        st.session_state[_CHAT_ERROR] = str(error)
+    st.rerun()
+
+
+def _render_courses(assistant: EduRAGAssistant) -> None:
+    """Affiche la bibliothèque et Smart Revision."""
+    st.title("Cours et fiches")
 
     st.header("Bibliothèque")
     uploaded = st.file_uploader("Importer un cours", type=["pdf"])
@@ -242,13 +420,22 @@ def main() -> None:
                 st.error(str(error))
             else:
                 st.success(f"Le cours « {added['filename']} » a été ajouté.")
+                st.rerun()
 
     documents = assistant.list_documents()
     if not documents:
         st.info("Aucun cours n'est enregistré pour le moment.")
     else:
         for document in documents:
-            st.write(document["filename"])
+            name_column, remove_column = st.columns([5, 1], vertical_alignment="center")
+            name_column.write(document["filename"])
+            if remove_column.button("Retirer", key=f"remove_{document['document_id']}"):
+                try:
+                    _remove_course(assistant, str(document["document_id"]))
+                except (OSError, ValueError, RuntimeError) as error:
+                    st.error(str(error))
+                else:
+                    st.rerun()
 
     st.header("Nouvelle fiche de révision")
     if not documents:
@@ -327,6 +514,30 @@ def main() -> None:
             st.error(str(error))
         else:
             _offer_downloads(assistant, opened_id, "opened")
+
+
+def _choice(label: str, options: tuple[tuple[str, str], ...]) -> str:
+    """Affiche un libellé et renvoie la valeur interne correspondante."""
+    labels = [item[0] for item in options]
+    selected = st.selectbox(label, labels)
+    return dict(options)[selected]
+
+
+def main() -> None:
+    """Affiche la conversation, ou les cours et les fiches."""
+    st.set_page_config(
+        page_title="EduRAG",
+        page_icon="📚",
+        layout="wide",
+    )
+    _apply_layout()
+    with st.spinner("Ouverture de l'assistant…"):
+        assistant = get_assistant()
+    _render_sidebar(assistant)
+    if st.session_state.get(_SCREEN) == _COURSES_SCREEN:
+        _render_courses(assistant)
+        return
+    _render_chat(assistant)
 
 
 if __name__ == "__main__":

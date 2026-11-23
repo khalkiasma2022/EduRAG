@@ -17,6 +17,7 @@ from src.retrieval.vector_store import MANIFEST_NAME
 from src.revision.export import RevisionExport
 from src.revision.sheet import RevisionSheet
 from src.revision.store import RevisionStore
+from src.tutor.store import ConversationStore
 
 import src.assistant as assistant_module
 
@@ -678,3 +679,216 @@ def test_export_revision_rejects_a_bad_sheet_id(
     assert markdown_calls == []
     assert pdf_calls == []
     assert len(assistant.llm.prompts) == before["prompts"]
+
+
+def _source() -> dict[str, str | int]:
+    """Reproduit une source acceptée par le magasin des conversations."""
+    return {
+        "text": "La mitochondrie produit l'énergie.",
+        "filename": "cellule.pdf",
+        "page_number": 2,
+        "chunk_id": 4,
+    }
+
+
+def _answer_for(question: str, top_k: int = 3) -> dict[str, str | list[dict[str, str | int]]]:
+    """Imite le dictionnaire renvoyé par ask(), sans interroger le modèle."""
+    return {
+        "answer": f"Réponse à : {question}",
+        "sources": [_source()] if top_k > 0 else [],
+    }
+
+
+def test_conversation_database_follows_the_revision_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, created = _assistant(tmp_path, monkeypatch)
+    documents = (tmp_path / "documents").resolve()
+
+    assert isinstance(assistant.conversation_store, ConversationStore)
+    assert assistant.conversation_store.path == documents / "conversations.sqlite"
+    assert assistant.revision_store.path == documents / "revisions.sqlite"
+    assert (documents / "conversations.sqlite").is_file()
+    assert len(created["llm"]) == 1
+    assert len(created["embedding"]) == 1
+
+    custom_revision = tmp_path / "bases" / "fiches.sqlite"
+    chosen = assistant_module.EduRAGAssistant(
+        tmp_path / "documents",
+        tmp_path / "index",
+        custom_revision,
+    )
+
+    assert chosen.revision_store.path == custom_revision
+    assert chosen.conversation_store.path == tmp_path / "bases" / "conversations.sqlite"
+    assert (tmp_path / "bases" / "conversations.sqlite").is_file()
+
+
+def test_conversation_database_path_can_be_chosen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = _install_fakes(monkeypatch)
+    database = tmp_path / "echanges" / "conversations.sqlite"
+    documents = (tmp_path / "documents").resolve()
+
+    assistant = assistant_module.EduRAGAssistant(
+        tmp_path / "documents",
+        tmp_path / "index",
+        conversation_database_path=database,
+    )
+
+    assert assistant.conversation_store.path == database
+    assert database.is_file()
+    assert assistant.revision_store.path == documents / "revisions.sqlite"
+    assert not (documents / "conversations.sqlite").exists()
+    assert len(created["llm"]) == 1
+    assert len(created["embedding"]) == 1
+
+
+def test_conversations_can_be_created_listed_read_and_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    assistant.ask = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("La gestion des conversations ne doit pas interroger le modèle.")
+    )
+
+    assert assistant.list_conversations() == []
+    older = assistant.create_conversation("Ancienne")
+    newer = assistant.create_conversation("Récente")
+
+    assert isinstance(older, int) and older > 0
+    assert isinstance(newer, int) and newer != older
+    assert [conversation["id"] for conversation in assistant.list_conversations()] == [newer, older]
+    assert assistant.get_conversation(older)["title"] == "Ancienne"
+    assert assistant.get_conversation(older)["messages"] == []
+
+    assistant.delete_conversation(older)
+
+    assert [conversation["id"] for conversation in assistant.list_conversations()] == [newer]
+    with pytest.raises(ValueError, match="introuvable"):
+        assistant.get_conversation(older)
+
+
+def test_send_message_asks_once_and_saves_the_question_the_answer_and_the_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("Mitochondrie")
+    calls: list[tuple[str, int]] = []
+
+    def spy_ask(question: str, top_k: int = 3) -> dict[str, str | list[dict[str, str | int]]]:
+        stored = assistant.get_conversation(conversation_id)
+        assert stored["messages"][-1]["role"] == "user"
+        assert stored["messages"][-1]["content"] == question
+        calls.append((question, top_k))
+        return _answer_for(question, top_k)
+
+    assistant.ask = spy_ask
+
+    first = assistant.send_message(conversation_id, "Que produit la mitochondrie ?")
+    second = assistant.send_message(conversation_id, "Sur quelle page ?", top_k=2)
+    assistant.ask = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("La consultation ne doit pas interroger le modèle.")
+    )
+    reopened = assistant.get_conversation(conversation_id)
+
+    assert calls == [("Que produit la mitochondrie ?", 3), ("Sur quelle page ?", 2)]
+    assert first["conversation_id"] == conversation_id
+    assert first["question"]["role"] == "user"
+    assert first["question"]["content"] == "Que produit la mitochondrie ?"
+    assert first["question"]["sources"] == []
+    assert first["answer"]["role"] == "assistant"
+    assert first["answer"]["content"] == "Réponse à : Que produit la mitochondrie ?"
+    assert first["answer"]["sources"] == [_source()]
+    assert second["answer"]["sources"] == [_source()]
+    assert [message["content"] for message in reopened["messages"]] == [
+        "Que produit la mitochondrie ?",
+        "Réponse à : Que produit la mitochondrie ?",
+        "Sur quelle page ?",
+        "Réponse à : Sur quelle page ?",
+    ]
+    assert reopened["messages"][1]["sources"] == [_source()]
+    assert reopened["messages"][3]["sources"] == [_source()]
+
+
+def test_reading_a_conversation_does_not_call_the_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("Déjà enregistrée")
+    assistant.ask = lambda *args, **kwargs: _answer_for("Question enregistrée")
+    assistant.send_message(conversation_id, "Question enregistrée")
+    assistant.ask = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("La consultation ne doit pas interroger le modèle.")
+    )
+
+    loaded = assistant.get_conversation(conversation_id)
+    listed = assistant.list_conversations()
+
+    assert loaded["messages"][0]["content"] == "Question enregistrée"
+    assert loaded["messages"][1]["content"] == "Réponse à : Question enregistrée"
+    assert listed[0]["id"] == conversation_id
+
+
+def test_missing_conversation_does_not_call_the_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    calls: list[str] = []
+
+    def spy_ask(question: str, top_k: int = 3) -> dict[str, str | list]:
+        calls.append(question)
+        return _answer_for(question, top_k)
+
+    assistant.ask = spy_ask
+
+    with pytest.raises(ValueError, match="introuvable"):
+        assistant.send_message(4, "Question sans conversation")
+
+    assert calls == []
+    assert assistant.list_conversations() == []
+
+
+def test_failed_answer_is_not_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("Échec")
+    calls: list[str] = []
+
+    def fail_ask(question: str, top_k: int = 3) -> dict[str, str | list]:
+        calls.append(question)
+        raise RuntimeError("La génération de la réponse a échoué.")
+
+    assistant.ask = fail_ask
+
+    with pytest.raises(RuntimeError, match="génération"):
+        assistant.send_message(conversation_id, "Question interrompue")
+
+    stored = assistant.get_conversation(conversation_id)
+    assert calls == ["Question interrompue"]
+    assert [message["role"] for message in stored["messages"]] == ["user"]
+    assert stored["messages"][0]["content"] == "Question interrompue"
+
+
+def test_conversation_remains_after_a_new_assistant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("Persistante")
+    assistant.ask = lambda *args, **kwargs: _answer_for("Question conservée")
+    assistant.send_message(conversation_id, "Question conservée")
+    saved = assistant.get_conversation(conversation_id)
+
+    restarted = assistant_module.EduRAGAssistant(
+        tmp_path / "documents",
+        tmp_path / "index",
+    )
+    restarted.ask = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("La réouverture ne doit pas interroger le modèle.")
+    )
+
+    assert restarted.list_conversations() == assistant.list_conversations()
+    assert restarted.get_conversation(conversation_id) == saved
+    assert restarted.llm.prompts == []

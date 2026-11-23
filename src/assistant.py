@@ -1,7 +1,7 @@
 """Objet central d'EduRAG.
 
 Il crée les modèles une seule fois, puis les partage
-entre la bibliothèque de PDF, la chaîne de réponse et les fiches.
+entre la bibliothèque de PDF, la chaîne de réponse, les fiches et les conversations.
 """
 
 from pathlib import Path
@@ -18,6 +18,7 @@ from src.retrieval.vector_store import (
 from src.revision.export import RevisionExport
 from src.revision.sheet import RevisionSheet
 from src.revision.store import RevisionStore
+from src.tutor.store import ConversationStore
 
 
 class EduRAGAssistant:
@@ -28,12 +29,15 @@ class EduRAGAssistant:
         documents_directory: str | Path,
         index_directory: str | Path,
         revision_database_path: str | Path | None = None,
+        conversation_database_path: str | Path | None = None,
     ) -> None:
         """Crée les composants, puis ouvre ou reconstruit l'index si besoin."""
         self.documents_directory = Path(documents_directory).resolve()
         self.index_directory = Path(index_directory).resolve()
         if revision_database_path is None:
             revision_database_path = self.documents_directory / "revisions.sqlite"
+        if conversation_database_path is None:
+            conversation_database_path = Path(revision_database_path).parent / "conversations.sqlite"
 
         # Une seule création : les mêmes objets sont ensuite réutilisés.
         self.embedding_model = EmbeddingModel()
@@ -53,6 +57,7 @@ class EduRAGAssistant:
         self.revision_sheet = RevisionSheet(self.library, self.llm)
         self.revision_store = RevisionStore(revision_database_path)
         self.revision_export = RevisionExport()
+        self.conversation_store = ConversationStore(conversation_database_path)
         self._open_existing_index()
 
     def create_revision(
@@ -124,6 +129,49 @@ class EduRAGAssistant:
     ) -> dict[str, str | list[dict[str, str | int]]]:
         """Pose une question sans recharger les modèles."""
         return self.rag_chain.ask(question, top_k=top_k)
+
+    def create_conversation(self, title: str) -> int:
+        """Crée une conversation vide et renvoie son identifiant."""
+        created = self.conversation_store.create_conversation(title)
+        return int(created["id"])
+
+    def list_conversations(self) -> list[dict[str, str | int]]:
+        """Retourne les conversations, de la plus récente à la plus ancienne."""
+        return self.conversation_store.list_conversations()
+
+    def get_conversation(self, conversation_id: object) -> dict[str, str | int | list]:
+        """Relit une conversation enregistrée, sans interroger le modèle."""
+        return self.conversation_store.get_conversation(conversation_id)
+
+    def delete_conversation(self, conversation_id: object) -> None:
+        """Supprime une conversation et ses messages."""
+        self.conversation_store.delete_conversation(conversation_id)
+
+    def send_message(
+        self,
+        conversation_id: object,
+        question: str,
+        top_k: int = 3,
+    ) -> dict[str, str | int | dict]:
+        """Enregistre la question, appelle ask() une fois, puis enregistre la réponse.
+
+        Les messages précédents ne sont pas transmis au modèle.
+        Si la réponse échoue, elle n'est pas enregistrée.
+        """
+        self.get_conversation(conversation_id)
+        question_message = self.conversation_store.add_message(conversation_id, "user", question)
+        result = self.ask(question, top_k=top_k)
+        answer_message = self.conversation_store.add_message(
+            conversation_id,
+            "assistant",
+            result["answer"],
+            sources=result["sources"],
+        )
+        return {
+            "conversation_id": question_message["conversation_id"],
+            "question": question_message,
+            "answer": answer_message,
+        }
 
     def _open_existing_index(self) -> None:
         """Charge un index valide, ou le reconstruit si des PDF n'ont pas d'index.
