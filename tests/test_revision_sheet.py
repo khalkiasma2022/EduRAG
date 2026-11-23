@@ -618,7 +618,7 @@ def test_generate_writes_a_complete_sheet(tmp_path: Path) -> None:
     llm = _GeneratingLLM(
         reply="Python, variables et fonctions.",
         prompt_tokens=10,
-        config=_FakeConfig(max_position_embeddings=1000),
+        config=_FakeConfig(max_position_embeddings=2048),
     )
     sheet, added = _course_sheet(tmp_path, llm)
 
@@ -633,7 +633,7 @@ def test_generate_writes_a_complete_sheet(tmp_path: Path) -> None:
     assert result["level"] == "advanced"
     assert result["sheet_type"] == "complete"
     assert llm.calls == 1
-    assert llm.token_limits == [512]
+    assert llm.token_limits == [1024]
     assert "Detailed sheet" in llm.prompts[0]
 
 
