@@ -63,6 +63,7 @@ EXPECTED_PACKAGES = {
     "fastapi",
     "uvicorn",
     "httpx",
+    "python-multipart",
 }
 
 IGNORED_BY_GIT = (

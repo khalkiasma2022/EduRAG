@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.dependencies import register_assistant
+from src.api.routes.documents import router as documents_router
 
 # Origines du serveur Vite, futur frontend React.
 _DEFAULT_CORS_ORIGINS = (
@@ -69,6 +70,7 @@ def create_app(assistant: object | None = None) -> FastAPI:
         """Indique que l'API répond, sans interroger l'agent."""
         return {"status": "ok"}
 
+    app.include_router(documents_router)
     return app
 
 
