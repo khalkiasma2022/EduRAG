@@ -36,3 +36,8 @@ python-dotenv==1.2.4
 
 # Tests automatisés
 pytest==9.2.0
+
+# API HTTP. Streamlit reste en place. Le client httpx sert aux tests de l'API.
+fastapi==0.165.0
+uvicorn==0.54.0
+httpx==0.28.1

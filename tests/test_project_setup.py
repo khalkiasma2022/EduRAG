@@ -60,6 +60,9 @@ EXPECTED_PACKAGES = {
     "sentence-transformers",
     "python-dotenv",
     "pytest",
+    "fastapi",
+    "uvicorn",
+    "httpx",
 }
 
 IGNORED_BY_GIT = (
