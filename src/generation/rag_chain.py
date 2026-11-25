@@ -15,6 +15,8 @@ _MIN_LANGUAGE_LETTERS = 20
 MAX_CONTEXT_CHARS = 8000
 # La vérification répond par un seul mot : quelques jetons suffisent.
 _VERIFICATION_MAX_NEW_TOKENS = 8
+# Budget d'une réponse du chat PDF. Il reste dans la limite du module LLM.
+_ANSWER_MAX_NEW_TOKENS = 1024
 
 _RULES = """Tu es EduRAG, un assistant pédagogique universitaire.
 
@@ -606,7 +608,7 @@ def _is_positive_word(raw: object, language: str) -> bool:
 def _generate_answer(llm: object, prompt: str) -> str:
     """Demande la réponse au LLM déjà chargé."""
     try:
-        answer = llm.generate(prompt)
+        answer = llm.generate(prompt, max_new_tokens=_ANSWER_MAX_NEW_TOKENS)
     except Exception as error:
         raise RuntimeError("La génération de la réponse a échoué.") from error
 

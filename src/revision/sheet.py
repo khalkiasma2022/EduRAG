@@ -11,7 +11,7 @@ _LANGUAGES = frozenset({"fr", "en", "ar"})
 _LEVELS = frozenset({"beginner", "intermediate", "advanced"})
 _SHEET_TYPES = frozenset({"short", "complete"})
 # Budget de réponse réservé avant l'appel au modèle déjà chargé.
-_SHEET_TOKEN_BUDGETS = {"short": 256, "complete": 1024}
+_SHEET_TOKEN_BUDGETS = {"short": 512, "complete": 2048}
 
 # Consignes, niveaux et formes de fiche. Le cours est ajouté ensuite.
 _REVISION_PROMPTS = {

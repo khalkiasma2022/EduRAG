@@ -195,7 +195,7 @@ def test_missing_passages_call_general_knowledge() -> None:
     assert "Connaissances générales" in prompt
     assert "Tu n'inventes jamais de nom de fichier ni de numéro de page." in prompt
     assert len(llm.prompts) == 1
-    assert llm.token_limits == [512]
+    assert llm.token_limits == [1024]
     assert not _is_verification_prompt(prompt)
 
 
@@ -805,7 +805,7 @@ def test_verification_uses_eight_tokens_and_the_answer_keeps_the_default() -> No
 
     chain.ask("Qu'est-ce qu'une variable dans ce cours ?")
 
-    assert llm.token_limits == [8, 8, 512]
+    assert llm.token_limits == [8, 8, 1024]
 
 
 def test_verification_prompts_teach_a_negative_and_a_positive_example() -> None:

@@ -12,9 +12,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Modèle instructif léger, prévu pour tourner sur un GPU de Colab.
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-DEFAULT_MAX_NEW_TOKENS = 512
+DEFAULT_MAX_NEW_TOKENS = 1024
 # Plafond pour éviter une génération trop longue et trop coûteuse en mémoire.
-MAX_NEW_TOKENS_LIMIT = 1024
+MAX_NEW_TOKENS_LIMIT = 2048
 
 
 class LLM:

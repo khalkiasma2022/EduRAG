@@ -76,7 +76,7 @@ def test_generate_returns_only_new_text(llm_parts) -> None:
     assert answer == "Réponse simulée"
     decoded_ids = tokenizer.decode.call_args.args[0]
     assert decoded_ids.tolist() == [10, 11]
-    assert model.generate.call_args.kwargs["max_new_tokens"] == 512
+    assert model.generate.call_args.kwargs["max_new_tokens"] == 1024
     tokenizer.apply_chat_template.assert_called_once()
     assert tokenizer.apply_chat_template.call_args.kwargs["add_generation_prompt"] is True
 
@@ -133,7 +133,15 @@ def test_invalid_prompts_raise(llm_parts, prompt) -> None:
         language_model.generate(prompt)
 
 
-@pytest.mark.parametrize("max_new_tokens", [0, -1, True, "512", 1025])
+def test_max_new_tokens_limit_accepts_2048(llm_parts) -> None:
+    language_model, _tokenizer_cls, _model_cls, _tokenizer, model = llm_parts
+
+    language_model.generate("Question", max_new_tokens=2048)
+
+    assert model.generate.call_args.kwargs["max_new_tokens"] == 2048
+
+
+@pytest.mark.parametrize("max_new_tokens", [0, -1, True, False, 1.5, "512", 2049])
 def test_invalid_max_new_tokens_raise(llm_parts, max_new_tokens) -> None:
     language_model, _tokenizer_cls, _model_cls, _tokenizer, _model = llm_parts
 

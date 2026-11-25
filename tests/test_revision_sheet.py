@@ -504,7 +504,18 @@ def test_length_check_refuses_a_sliding_window() -> None:
     assert llm.calls == 0
 
 
-@pytest.mark.parametrize("max_new_tokens", [0, -1, 1025, True, 1.5, "8"])
+def test_length_check_accepts_the_complete_sheet_budget() -> None:
+    llm = _LengthLLM(prompt_tokens=10, config=_FakeConfig(max_position_embeddings=4096))
+    sheet = _length_sheet(llm)
+
+    measured = sheet.ensure_prompt_fits("Fiche", max_new_tokens=2048)
+
+    assert measured["reserved_tokens"] == 2048
+    assert measured["total_tokens"] == 2058
+    assert llm.calls == 0
+
+
+@pytest.mark.parametrize("max_new_tokens", [0, -1, 2049, True, False, 1.5, "8"])
 def test_length_check_refuses_an_invalid_token_budget(max_new_tokens: object) -> None:
     llm = _LengthLLM()
     sheet = _length_sheet(llm)
@@ -609,7 +620,7 @@ def test_generate_writes_a_short_sheet(tmp_path: Path) -> None:
         "sheet_type": "short",
     }
     assert llm.calls == 1
-    assert llm.token_limits == [256]
+    assert llm.token_limits == [512]
     assert "Page deux variables" in llm.prompts[0]
     assert "Fiche courte" in llm.prompts[0]
 
@@ -618,7 +629,7 @@ def test_generate_writes_a_complete_sheet(tmp_path: Path) -> None:
     llm = _GeneratingLLM(
         reply="Python, variables et fonctions.",
         prompt_tokens=10,
-        config=_FakeConfig(max_position_embeddings=2048),
+        config=_FakeConfig(max_position_embeddings=4096),
     )
     sheet, added = _course_sheet(tmp_path, llm)
 
@@ -633,7 +644,7 @@ def test_generate_writes_a_complete_sheet(tmp_path: Path) -> None:
     assert result["level"] == "advanced"
     assert result["sheet_type"] == "complete"
     assert llm.calls == 1
-    assert llm.token_limits == [1024]
+    assert llm.token_limits == [2048]
     assert "Detailed sheet" in llm.prompts[0]
 
 
