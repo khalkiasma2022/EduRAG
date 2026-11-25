@@ -1,6 +1,6 @@
 """Sérialise les appels qui touchent Qwen ou FAISS.
 
-Les lectures restent servies pendant une génération.
+Les lectures et les exports de fiches restent servis pendant une génération.
 Le verrou asyncio attend sans occuper le thread du serveur.
 La génération elle-même reste dans un fil, car la route est synchrone.
 """
@@ -11,7 +11,7 @@ import asyncio
 def agent_call_is_exclusive(method: str, path: str) -> bool:
     """Indique si la requête utilise le modèle ou reconstruit l'index."""
     normalized = path.rstrip("/") or "/"
-    if method == "POST" and normalized == "/documents":
+    if method == "POST" and normalized in {"/documents", "/revisions"}:
         return True
     if method == "DELETE" and normalized.startswith("/documents/"):
         return True

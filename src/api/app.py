@@ -18,6 +18,7 @@ from src.api.dependencies import register_assistant
 from src.api.guard import ExclusiveAgentMiddleware
 from src.api.routes.conversations import router as conversations_router
 from src.api.routes.documents import router as documents_router
+from src.api.routes.revisions import router as revisions_router
 
 # Origines du serveur Vite, futur frontend React.
 _DEFAULT_CORS_ORIGINS = (
@@ -69,7 +70,8 @@ def create_app(assistant: object | None = None) -> FastAPI:
         allow_headers=["Accept", "Content-Type"],
     )
     # Dernier middleware ajouté : il entoure les autres.
-    # Il met en file l'import PDF, le retrait PDF et l'envoi d'une question.
+    # Il met en file l'import PDF, le retrait PDF, l'envoi d'une question
+    # et la génération d'une fiche.
     app.add_middleware(ExclusiveAgentMiddleware, lock=app.state.agent_lock)
 
     @app.get("/health")
@@ -79,6 +81,7 @@ def create_app(assistant: object | None = None) -> FastAPI:
 
     app.include_router(documents_router)
     app.include_router(conversations_router)
+    app.include_router(revisions_router)
     return app
 
 
