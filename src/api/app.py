@@ -6,6 +6,7 @@ Cette application répond sans charger Qwen, MiniLM ni les index.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -14,6 +15,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.dependencies import register_assistant
+from src.api.guard import ExclusiveAgentMiddleware
+from src.api.routes.conversations import router as conversations_router
 from src.api.routes.documents import router as documents_router
 
 # Origines du serveur Vite, futur frontend React.
@@ -54,6 +57,7 @@ def create_app(assistant: object | None = None) -> FastAPI:
     """Crée l'application et, au besoin, enregistre un seul agent."""
     app = FastAPI(title="EduRAG", lifespan=_lifespan)
     app.state.assistant = None
+    app.state.agent_lock = asyncio.Lock()
     if assistant is not None:
         register_assistant(app, assistant)
 
@@ -64,6 +68,9 @@ def create_app(assistant: object | None = None) -> FastAPI:
         allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Accept", "Content-Type"],
     )
+    # Dernier middleware ajouté : il entoure les autres.
+    # Il met en file l'import PDF, le retrait PDF et l'envoi d'une question.
+    app.add_middleware(ExclusiveAgentMiddleware, lock=app.state.agent_lock)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -71,6 +78,7 @@ def create_app(assistant: object | None = None) -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(documents_router)
+    app.include_router(conversations_router)
     return app
 
 
