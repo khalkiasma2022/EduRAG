@@ -783,13 +783,59 @@ def _course_sheet(tmp_path: Path, llm: _GeneratingLLM) -> tuple[RevisionSheet, d
     return RevisionSheet(library, llm), added
 
 
+class _FakeEngine:
+    """Remplace RevisionEngine pour tester l'adaptateur RevisionSheet.generate."""
+
+    def __init__(self, library: object, llm: object, *, result: dict | None = None, error: Exception | None = None) -> None:
+        self.library = library
+        self.llm = llm
+        self.result = result
+        self.error = error
+        self.calls: list[dict] = []
+
+    def run(self, document_id: str, page_start=None, page_end=None, language="fr", level="beginner", sheet_type="complete"):
+        self.calls.append(
+            {
+                "document_id": document_id,
+                "page_start": page_start,
+                "page_end": page_end,
+                "language": language,
+                "level": level,
+                "sheet_type": sheet_type,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return dict(self.result)
+
+
 def test_generate_writes_a_short_sheet(tmp_path: Path) -> None:
     llm = _GeneratingLLM(
-        reply="Variables : une variable garde une valeur.",
+        reply="unused",
         prompt_tokens=10,
         config=_FakeConfig(max_position_embeddings=1000),
     )
-    sheet, added = _course_sheet(tmp_path, llm)
+    library_sheet, added = _course_sheet(tmp_path, llm)
+    engine = _FakeEngine(
+        library_sheet.library,
+        llm,
+        result={
+            "content": "Variables : une variable garde une valeur.",
+            "document_id": added["document_id"],
+            "filename": "cours_python.pdf",
+            "page_start": 2,
+            "page_end": 2,
+            "language": "fr",
+            "level": "beginner",
+            "sheet_type": "short",
+        },
+    )
+    sheet = RevisionSheet(
+        library_sheet.library,
+        llm,
+        engine_factory=lambda library, model: engine,
+    )
 
     result = sheet.generate(
         added["document_id"],
@@ -810,19 +856,46 @@ def test_generate_writes_a_short_sheet(tmp_path: Path) -> None:
         "level": "beginner",
         "sheet_type": "short",
     }
-    assert llm.calls == 1
-    assert llm.token_limits == [512]
-    assert "Page deux variables" in llm.prompts[0]
-    assert "Fiche courte" in llm.prompts[0]
+    assert engine.calls == [
+        {
+            "document_id": added["document_id"],
+            "page_start": 2,
+            "page_end": 2,
+            "language": "fr",
+            "level": "beginner",
+            "sheet_type": "short",
+        }
+    ]
+    assert engine.llm is llm
+    assert llm.calls == 0
 
 
 def test_generate_writes_a_complete_sheet(tmp_path: Path) -> None:
     llm = _GeneratingLLM(
-        reply="Python, variables et fonctions.",
+        reply="unused",
         prompt_tokens=10,
         config=_FakeConfig(max_position_embeddings=4096),
     )
-    sheet, added = _course_sheet(tmp_path, llm)
+    library_sheet, added = _course_sheet(tmp_path, llm)
+    engine = _FakeEngine(
+        library_sheet.library,
+        llm,
+        result={
+            "content": "Python, variables et fonctions.",
+            "document_id": added["document_id"],
+            "filename": "cours_python.pdf",
+            "page_start": 1,
+            "page_end": 3,
+            "language": "en",
+            "level": "advanced",
+            "sheet_type": "complete",
+        },
+    )
+    sheet = RevisionSheet(
+        library_sheet.library,
+        llm,
+        engine_factory=lambda library, model: engine,
+    )
 
     result = sheet.generate(added["document_id"], language="en", level="advanced", sheet_type="complete")
 
@@ -834,51 +907,117 @@ def test_generate_writes_a_complete_sheet(tmp_path: Path) -> None:
     assert result["language"] == "en"
     assert result["level"] == "advanced"
     assert result["sheet_type"] == "complete"
-    assert llm.calls == 1
-    assert llm.token_limits == [2048]
-    assert "Complete sheet" in llm.prompts[0]
-    assert _COMPLETE_INSTRUCTIONS["en"] in llm.prompts[0]
-    assert _COMPLETE_STRUCTURE["en"] in llm.prompts[0]
+    assert engine.calls[0]["sheet_type"] == "complete"
+    assert engine.calls[0]["language"] == "en"
+    assert engine.calls[0]["level"] == "advanced"
+    assert llm.calls == 0
 
 
-def test_generate_refuses_before_calling_the_model_when_the_context_is_too_large(tmp_path: Path) -> None:
+def test_generate_propagates_engine_context_error(tmp_path: Path) -> None:
     llm = _GeneratingLLM(prompt_tokens=20, config=_FakeConfig(max_position_embeddings=100))
-    sheet, added = _course_sheet(tmp_path, llm)
+    library_sheet, added = _course_sheet(tmp_path, llm)
+    engine = _FakeEngine(
+        library_sheet.library,
+        llm,
+        error=ValueError("Le cours sélectionné est trop volumineux. Sélectionnez moins de pages."),
+    )
+    sheet = RevisionSheet(
+        library_sheet.library,
+        llm,
+        engine_factory=lambda library, model: engine,
+    )
 
     with pytest.raises(ValueError, match="trop volumineux"):
         sheet.generate(added["document_id"], sheet_type="complete")
 
     assert llm.calls == 0
-    assert llm.prompts == []
 
 
 @pytest.mark.parametrize("reply", ["", "   "])
 def test_generate_refuses_an_empty_sheet(tmp_path: Path, reply: str) -> None:
-    llm = _GeneratingLLM(reply=reply, prompt_tokens=10, config=_FakeConfig(max_position_embeddings=1000))
-    sheet, added = _course_sheet(tmp_path, llm)
+    llm = _GeneratingLLM(reply="unused", prompt_tokens=10, config=_FakeConfig(max_position_embeddings=1000))
+    library_sheet, added = _course_sheet(tmp_path, llm)
+    engine = _FakeEngine(
+        library_sheet.library,
+        llm,
+        result={
+            "content": reply,
+            "document_id": added["document_id"],
+            "filename": "cours_python.pdf",
+            "page_start": 1,
+            "page_end": 1,
+            "language": "fr",
+            "level": "beginner",
+            "sheet_type": "short",
+        },
+    )
+    sheet = RevisionSheet(
+        library_sheet.library,
+        llm,
+        engine_factory=lambda library, model: engine,
+    )
 
     with pytest.raises(ValueError, match="vide"):
         sheet.generate(added["document_id"], page_start=1, page_end=1, sheet_type="short")
 
-    assert llm.calls == 1
-
 
 @pytest.mark.parametrize("reply", [None, 12])
 def test_generate_refuses_a_non_string_sheet(tmp_path: Path, reply: object) -> None:
-    llm = _GeneratingLLM(reply=reply, prompt_tokens=10, config=_FakeConfig(max_position_embeddings=1000))
-    sheet, added = _course_sheet(tmp_path, llm)
+    llm = _GeneratingLLM(reply="unused", prompt_tokens=10, config=_FakeConfig(max_position_embeddings=1000))
+    library_sheet, added = _course_sheet(tmp_path, llm)
+    engine = _FakeEngine(
+        library_sheet.library,
+        llm,
+        result={
+            "content": reply,
+            "document_id": added["document_id"],
+            "filename": "cours_python.pdf",
+            "page_start": 1,
+            "page_end": 1,
+            "language": "fr",
+            "level": "beginner",
+            "sheet_type": "short",
+        },
+    )
+    sheet = RevisionSheet(
+        library_sheet.library,
+        llm,
+        engine_factory=lambda library, model: engine,
+    )
 
     with pytest.raises(ValueError, match="invalide"):
         sheet.generate(added["document_id"], page_start=1, page_end=1, sheet_type="short")
 
-    assert llm.calls == 1
-
 
 def test_generate_refuses_an_unknown_document(tmp_path: Path) -> None:
     llm = _GeneratingLLM(prompt_tokens=10, config=_FakeConfig(max_position_embeddings=1000))
-    sheet, _added = _course_sheet(tmp_path, llm)
+    library_sheet, _added = _course_sheet(tmp_path, llm)
+    engine = _FakeEngine(
+        library_sheet.library,
+        llm,
+        error=ValueError("Document introuvable dans la bibliothèque."),
+    )
+    sheet = RevisionSheet(
+        library_sheet.library,
+        llm,
+        engine_factory=lambda library, model: engine,
+    )
 
     with pytest.raises(ValueError, match="introuvable"):
         sheet.generate("document-absent", sheet_type="short")
 
     assert llm.calls == 0
+
+
+def test_generate_rejects_engine_with_different_llm_instance(tmp_path: Path) -> None:
+    llm = _GeneratingLLM(prompt_tokens=10, config=_FakeConfig(max_position_embeddings=1000))
+    other = _GeneratingLLM(prompt_tokens=10, config=_FakeConfig(max_position_embeddings=1000))
+    library_sheet, added = _course_sheet(tmp_path, llm)
+    engine = _FakeEngine(library_sheet.library, other, result={"content": "x", "filename": "a.pdf", "page_start": 1, "page_end": 1})
+    sheet = RevisionSheet(
+        library_sheet.library,
+        llm,
+        engine_factory=lambda library, model: engine,
+    )
+    with pytest.raises(ValueError, match="même instance Qwen"):
+        sheet.generate(added["document_id"], sheet_type="short")

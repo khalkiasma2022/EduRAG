@@ -20,6 +20,7 @@ from src.revision.store import RevisionStore
 from src.tutor.store import ConversationStore
 
 import src.assistant as assistant_module
+from tests.helpers_revision_v2 import revision_pipeline_reply
 
 
 def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
@@ -82,6 +83,9 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
 
         def generate(self, prompt: str, max_new_tokens: int = 512) -> str:
             self.prompts.append(prompt)
+            revision_reply = revision_pipeline_reply(prompt)
+            if revision_reply is not None:
+                return revision_reply
             if "Réponds par un seul mot" in prompt:
                 return "oui"
             return "Réponse de test."
@@ -438,7 +442,8 @@ def test_create_revision_saves_one_sheet_without_searching(
     ]
     assert isinstance(saved["id"], int) and saved["id"] > 0
     assert isinstance(saved["created_at"], str) and saved["created_at"].strip() != ""
-    assert saved["content"] == "Réponse de test."
+    assert "Fiche de révision" in saved["content"]
+    assert "Explication originale" in saved["content"]
     assert saved["document_id"] == added["document_id"]
     assert saved["filename"] == "cours.pdf"
     assert saved["page_start"] == 2
@@ -455,6 +460,7 @@ def test_create_revision_saves_one_sheet_without_searching(
     assert len(created["embedding"]) == 1
     assert len(created["store"]) == 1
     assert assistant.revision_sheet.llm is assistant.llm
+    assert len(assistant.llm.prompts) >= 3
 
 
 def test_create_revision_does_not_save_when_generation_fails(
@@ -535,7 +541,7 @@ def test_list_and_get_revision_return_saved_sheets(
     assert found["language"] == "fr"
     assert found["level"] == "beginner"
     assert found["sheet_type"] == "short"
-    assert found["content"] == "Réponse de test."
+    assert "Fiche de révision" in found["content"]
     assert found["created_at"]
     assert len(assistant.llm.prompts) == before["prompts"]
     assert assistant.embedding_model.query_calls == before["queries"]
@@ -642,7 +648,9 @@ def test_export_revision_writes_markdown_and_pdf_from_sqlite(
     assert written_pdf == pdf_path
     assert pdf_path.read_bytes().startswith(b"%PDF")
     assert pdf_path.stat().st_size > 0
-    assert saved["content"] in pdf_text
+    # L'export PDF V1 aplatit le Markdown : on vérifie le fond, pas le Markdown brut.
+    assert "Explication originale" in pdf_text
+    assert "Contenu fidèle extrait du cours fourni." in pdf_text
     assert saved["filename"] in pdf_text
     assert saved["created_at"] in pdf_text
     assert "Français" in pdf_text

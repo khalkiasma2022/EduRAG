@@ -1,8 +1,12 @@
 """Fiches de révision construites à partir d'un cours déjà enregistré.
 
-Les pages sont relues, puis un prompt est préparé.
-La longueur est contrôlée avant l'unique appel au modèle déjà chargé.
+La génération délègue au moteur V2 (RevisionEngine).
+Les helpers de lecture / prompt V1 restent disponibles pour les tests et l'export.
 """
+
+from __future__ import annotations
+
+from collections.abc import Callable
 
 from src.generation.llm import MAX_NEW_TOKENS_LIMIT
 from src.ingestion.pdf_loader import load_pdf
@@ -225,8 +229,17 @@ _SHEET_LINES = {
 class RevisionSheet:
     """Prépare une fiche à partir d'un document de la bibliothèque."""
 
-    def __init__(self, library: object, llm: object) -> None:
-        """Conserve la bibliothèque et le modèle déjà créés."""
+    def __init__(
+        self,
+        library: object,
+        llm: object,
+        *,
+        engine_factory: Callable[[object, object], object] | None = None,
+    ) -> None:
+        """Conserve la bibliothèque et le modèle déjà créés.
+
+        engine_factory permet d'injecter RevisionEngine (tests) sans second Qwen.
+        """
         if not callable(getattr(library, "list_documents", None)):
             raise TypeError("library doit fournir list_documents.")
         if not callable(getattr(llm, "generate", None)):
@@ -234,6 +247,7 @@ class RevisionSheet:
 
         self.library = library
         self.llm = llm
+        self._engine_factory = engine_factory
 
     def read_pages(
         self,
@@ -317,22 +331,42 @@ class RevisionSheet:
         level: str = "beginner",
         sheet_type: str = "complete",
     ) -> dict[str, str | int]:
-        """Produit une fiche pour les pages demandées.
+        """Produit une fiche via RevisionEngine (sans sauvegarde).
 
-        Le contrôle de longueur a lieu avant l'unique appel au modèle reçu.
+        Les paramètres restent ceux de l'API : document, pages, langue, niveau, type.
         """
-        pages = self.read_pages(document_id, page_start, page_end)
-        prompt = self.build_prompt(pages, language, level, sheet_type)
-        max_new_tokens = _SHEET_TOKEN_BUDGETS[sheet_type]
-        self.ensure_prompt_fits(prompt, max_new_tokens)
-        content = self.llm.generate(prompt, max_new_tokens=max_new_tokens)
-        content = _check_generated_sheet(content)
+        _check_choice(language, _LANGUAGES, "La langue demandée n'est pas prise en charge.")
+        _check_choice(level, _LEVELS, "Le niveau demandé n'est pas pris en charge.")
+        _check_choice(sheet_type, _SHEET_TYPES, "Le type de fiche demandé n'est pas pris en charge.")
+
+        if self._engine_factory is not None:
+            engine = self._engine_factory(self.library, self.llm)
+        else:
+            # Import local pour éviter le cycle sheet ↔ llm_guard ↔ facade.
+            from src.revision.engine.facade import RevisionEngine
+
+            engine = RevisionEngine(self.library, self.llm)
+
+        if getattr(engine, "llm", None) is not self.llm:
+            raise ValueError(
+                "RevisionEngine doit réutiliser la même instance Qwen que RevisionSheet."
+            )
+
+        result = engine.run(
+            document_id,
+            page_start=page_start,
+            page_end=page_end,
+            language=language,
+            level=level,
+            sheet_type=sheet_type,
+        )
+        content = _check_generated_sheet(result.get("content"))
         return {
             "content": content,
             "document_id": document_id,
-            "filename": str(pages[0]["filename"]),
-            "page_start": int(pages[0]["page_number"]),
-            "page_end": int(pages[-1]["page_number"]),
+            "filename": str(result["filename"]),
+            "page_start": int(result["page_start"]),
+            "page_end": int(result["page_end"]),
             "language": language,
             "level": level,
             "sheet_type": sheet_type,

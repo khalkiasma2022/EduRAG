@@ -1,0 +1,22 @@
+# Dépendances et build
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Environnement
+.env
+.env.*.local
+
+# Logs et cache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.vite/
+
+# Éditeur / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

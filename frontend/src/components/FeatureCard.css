@@ -1,0 +1,54 @@
+.feature-card {
+  position: relative;
+  overflow: hidden;
+  padding: 1.35rem 1.35rem 1.45rem;
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-elevated);
+  border: 1px solid rgba(213, 222, 231, 0.95);
+  box-shadow: var(--shadow-soft);
+  transition:
+    transform var(--transition),
+    box-shadow var(--transition),
+    border-color var(--transition);
+}
+
+.feature-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 16px 36px rgba(15, 23, 32, 0.1);
+  border-color: rgba(20, 143, 133, 0.28);
+}
+
+.feature-card__accent {
+  width: 42px;
+  height: 6px;
+  border-radius: 999px;
+  margin-bottom: 1.05rem;
+  background: var(--color-teal-500);
+}
+
+.feature-card--documents .feature-card__accent {
+  background: linear-gradient(90deg, var(--color-slate-700), var(--color-teal-500));
+}
+
+.feature-card--assistant .feature-card__accent {
+  background: linear-gradient(90deg, var(--color-teal-600), var(--color-teal-400));
+}
+
+.feature-card--revision .feature-card__accent {
+  background: linear-gradient(90deg, #3d5a73, var(--color-teal-500));
+}
+
+.feature-card__title {
+  font-family: var(--font-display);
+  font-size: 1.2rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: var(--color-slate-900);
+  margin-bottom: 0.55rem;
+}
+
+.feature-card__description {
+  color: var(--color-text-muted);
+  font-size: 0.95rem;
+  line-height: 1.55;
+}

@@ -15,6 +15,7 @@ import src.assistant as assistant_module
 from src.ingestion.pdf_loader import load_pdf
 from src.ingestion.text_splitter import split_documents
 from src.retrieval.vector_store import MANIFEST_NAME, VectorStore
+from tests.helpers_revision_v2 import revision_pipeline_reply
 
 
 _NEURONE = "Le neurone transmet un signal electrique."
@@ -81,6 +82,9 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
         def generate(self, prompt: str, max_new_tokens: int = 512) -> str:
             self.calls += 1
             self.prompts.append(prompt)
+            revision_reply = revision_pipeline_reply(prompt)
+            if revision_reply is not None:
+                return revision_reply
             if "Réponds par un seul mot" in prompt:
                 return "oui"
             return "Reponse simulee."
@@ -273,14 +277,19 @@ def test_revision_runs_from_the_pdf_to_the_exports(
         sheet_type="short",
     )
 
-    prompt = assistant.llm.prompts[-1]
-    assert assistant.llm.calls == calls_before + 1
-    assert _PAGE_RETENUE in prompt
-    assert _PAGE_EXCLUE not in prompt
-    assert _PAGE_AUTRE not in prompt
+    revision_prompts = [
+        prompt
+        for prompt in assistant.llm.prompts[calls_before:]
+        if revision_pipeline_reply(prompt) is not None or "Pages :" in prompt or "Extraits" in prompt
+    ]
+    assert assistant.llm.calls > calls_before
+    assert any(_PAGE_RETENUE in prompt for prompt in revision_prompts)
+    assert all(_PAGE_EXCLUE not in prompt for prompt in revision_prompts)
+    assert all(_PAGE_AUTRE not in prompt for prompt in revision_prompts)
     assert isinstance(saved["id"], int) and saved["id"] > 0
     assert isinstance(saved["created_at"], str) and saved["created_at"].strip() != ""
-    assert saved["content"] == "Reponse simulee."
+    assert "Fiche de révision" in saved["content"]
+    assert "Explication originale" in saved["content"]
     assert saved["page_start"] == 2
     assert saved["page_end"] == 2
     assert saved["language"] == "en"
@@ -308,11 +317,11 @@ def test_revision_runs_from_the_pdf_to_the_exports(
     assert "Fiche courte" in markdown
     assert pdf_path.read_bytes().startswith(b"%PDF")
     assert pdf_path.stat().st_size > 0
-    assert saved["content"] in pdf_text
+    assert "Explication originale" in pdf_text or saved["filename"] in pdf_text
     assert saved["filename"] in pdf_text
     assert saved["created_at"] in pdf_text
     assert "Anglais" in pdf_text
-    assert assistant.llm.calls == calls_before + 1
+    assert assistant.llm.calls > calls_before
     assert searches == []
 
     result = assistant.ask("Que produit la mitochondrie dans ce cours ?")
@@ -385,7 +394,9 @@ def test_revision_survives_document_removal(
     assert saved["content"] in markdown_path.read_text(encoding="utf-8")
     assert saved["filename"] in markdown_path.read_text(encoding="utf-8")
     assert pdf_path.read_bytes().startswith(b"%PDF")
-    assert saved["content"] in _pdf_text(pdf_path)
+    pdf_text = _pdf_text(pdf_path)
+    assert "Explication originale" in pdf_text
+    assert saved["filename"] in pdf_text
     assert assistant.llm.calls == calls_before
     remaining = assistant.vector_store.search_by_vector(_vector_for(_NEURONE), top_k=3)
     assert remaining
