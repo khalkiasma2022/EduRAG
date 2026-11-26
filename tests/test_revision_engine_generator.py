@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from src.revision.engine.generator import OriginalContentGenerator
+from src.revision.engine.generator import OriginalContentGenerator, _build_chapter_prompt
 from src.revision.engine.llm_guard import (
     LlmBudgetGuard,
     MAX_LLM_CALLS,
@@ -649,3 +649,39 @@ def test_near_copy_of_source_paragraph_is_rejected() -> None:
             page_end=2,
             source_pages=_pages(),
         )
+
+
+def test_chapter_prompt_documents_exact_block_types_without_pipe_union() -> None:
+    plan = _plan("complete")
+    prompt = _build_chapter_prompt(
+        course=_course(),
+        plan=plan,
+        chapter_plan=plan.chapters[0],
+        previous_titles=[],
+        source_pages=_pages(),
+    )
+
+    assert (
+        '"type":"paragraph|definition|example|retain|table|diagram|synthesis|question"'
+        not in prompt
+    )
+    assert "paragraph|definition|example|retain|table|diagram|synthesis|question" not in prompt
+
+    for block_type in (
+        "paragraph",
+        "definition",
+        "example",
+        "retain",
+        "table",
+        "diagram",
+        "synthesis",
+        "question",
+    ):
+        assert f'"type":"{block_type}"' in prompt
+
+    assert "from_course" in prompt
+    assert "pedagogical_addition" in prompt
+    assert "headers" in prompt
+    assert "rows" in prompt
+    assert "concept_ids_covered" in prompt
+    assert "sans Markdown" in prompt

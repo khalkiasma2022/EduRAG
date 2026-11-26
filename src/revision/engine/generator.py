@@ -221,11 +221,31 @@ def _build_chapter_prompt(
         "- Distingue origin=from_course et origin=pedagogical_addition pour les exemples.\n"
         "- Si une CONTRADICTION apparaît dans les notes, signale-la sans la résoudre.\n"
         "- Interdit : URL, bibliographie, contact, remerciements, listes de mots-clés vides.\n"
-        "Schéma JSON : "
-        '{"index":0,"title":"...","concept_ids_covered":["..."],'
-        '"blocks":[{"type":"paragraph|definition|example|retain|table|diagram|synthesis|question",'
-        '"text":"...","origin":"from_course|pedagogical_addition","source_pages":[1],'
-        '"headers":[],"rows":[]}]}\n'
+        "Schéma JSON (objet unique, JSON complet uniquement, sans Markdown et sans fence "
+        "code) :\n"
+        "Structure obligatoire : index (entier), title (texte), concept_ids_covered (liste "
+        "d'identifiants), blocks (liste de blocs).\n"
+        "Chaque bloc doit avoir un seul champ type exact parmi : paragraph, definition, "
+        "example, retain, table, diagram, synthesis, question.\n"
+        "Interdit : mettre plusieurs types dans une seule valeur type, ou utiliser le "
+        "caractère | pour combiner des types.\n"
+        "Champs obligatoires par type :\n"
+        "- paragraph, definition, diagram, retain, synthesis, question : type, text\n"
+        "- example : type, text, origin "
+        "(origin exact : from_course ou pedagogical_addition)\n"
+        "- table : type, headers, rows\n"
+        "Exemples de blocs valides :\n"
+        '{"type":"paragraph","text":"..."}\n'
+        '{"type":"definition","text":"..."}\n'
+        '{"type":"example","text":"...","origin":"from_course"}\n'
+        '{"type":"retain","text":"..."}\n'
+        '{"type":"table","headers":["A","B"],"rows":[["1","2"]]}\n'
+        '{"type":"diagram","text":"..."}\n'
+        '{"type":"synthesis","text":"..."}\n'
+        '{"type":"question","text":"..."}\n'
+        "Exemple d'objet chapitre : "
+        '{"index":0,"title":"...","concept_ids_covered":["c1"],'
+        '"blocks":[{"type":"paragraph","text":"..."}]}\n'
         f"Plan global : {plan_titles}\n"
         f"Chapitres déjà rédigés : {previous}\n"
         f"Chapitre à rédiger : index={chapter_plan.index} ; titre={chapter_plan.title}\n"
