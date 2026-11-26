@@ -118,9 +118,11 @@ def _build_understanding_prompt(window: list[CoursePage]) -> str:
     pages_block = "\n\n".join(
         f"[Page {page.page_number}]\n{page.text}" for page in window
     )
+    allowed_kinds = ", ".join(sorted(_KIND_VALUES))
     return (
         "Tu es EduRAG. Analyse uniquement les pages fournies.\n"
         "Réponds UNIQUEMENT en JSON valide, sans Markdown.\n"
+        "Respecte exactement le schéma JSON demandé.\n"
         "Schéma attendu :\n"
         "{"
         '"themes": ["..."], '
@@ -129,6 +131,10 @@ def _build_understanding_prompt(window: list[CoursePage]) -> str:
         '"relations": [{"source_id":"...", "target_id":"...", "relation_type":"...", "pages":[1]}], '
         '"contradictions": [{"concept_id":"...", "description":"...", "pages":[1]}]'
         "}\n"
+        f"Le champ kind doit obligatoirement être l'une de ces six valeurs : {allowed_kinds}.\n"
+        "Aucune autre valeur n'est autorisée pour kind.\n"
+        "Pour une notion de type service informatique (PaaS, IaaS, SaaS), utilise kind=\"other\".\n"
+        "Ne jamais inventer de catégorie comme service, technology, concept ou tool.\n"
         "Règles : n'invente rien ; same_as seulement si la même notion est déjà identifiée ; "
         "ne fusionne pas deux notions proches mais distinctes.\n"
         f"Pages :\n{pages_block}"
@@ -177,9 +183,14 @@ def _load_json_object(raw: str) -> dict[str, Any]:
 
 
 def _concept_from_raw(raw: dict[str, Any]) -> Concept:
+    concept_id = str(raw.get("id") or "").strip() or "(inconnu)"
     kind = raw.get("kind")
     if kind not in _KIND_VALUES:
-        raise ValueError("JSON de compréhension invalide.")
+        allowed = ", ".join(sorted(_KIND_VALUES))
+        raise ValueError(
+            f"kind invalide pour le concept {concept_id!r} : reçu {kind!r}. "
+            f"Valeurs autorisées : {allowed}."
+        )
     pages = _int_list(raw.get("pages"))
     depends_on = raw.get("depends_on") or []
     if not isinstance(depends_on, list):

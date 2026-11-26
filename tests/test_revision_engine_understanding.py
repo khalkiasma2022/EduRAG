@@ -12,7 +12,12 @@ from src.revision.engine.llm_guard import (
     TOKENS_UNDERSTANDING,
 )
 from src.revision.engine.models import CoursePage
-from src.revision.engine.understanding import CourseUnderstanding
+from src.revision.engine.understanding import (
+    CourseUnderstanding,
+    _KIND_VALUES,
+    _build_understanding_prompt,
+    _concept_from_raw,
+)
 
 
 def _page(number: int, text: str, filename: str = "cours.pdf") -> CoursePage:
@@ -308,3 +313,99 @@ def test_too_many_windows_refused_without_truncation() -> None:
     with pytest.raises(ValueError, match="moins de pages"):
         CourseUnderstanding(llm, LlmBudgetGuard()).analyze(windows)
     assert llm.calls == 0
+
+
+def test_prompt_forbids_invented_kind_categories() -> None:
+    prompt = _build_understanding_prompt([_page(1, "PaaS et IaaS")])
+    assert "definition" in prompt
+    assert "formula" in prompt
+    assert "method" in prompt
+    assert "mechanism" in prompt
+    assert "relation" in prompt
+    assert "other" in prompt
+    assert 'kind="other"' in prompt or 'kind=\\"other\\"' in prompt or "kind=\"other\"" in prompt
+    assert "PaaS" in prompt
+    assert "IaaS" in prompt
+    assert "SaaS" in prompt
+    assert "service" in prompt.casefold()
+    assert "technology" in prompt.casefold()
+    assert "sans Markdown" in prompt
+    assert "service" not in _KIND_VALUES
+
+
+@pytest.mark.parametrize(
+    ("label", "concept_id"),
+    [("PaaS", "c_paas"), ("IaaS", "c_iaas")],
+)
+def test_cloud_service_notions_accepted_with_kind_other(label: str, concept_id: str) -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Cloud"],
+                concepts=[
+                    {
+                        "id": concept_id,
+                        "label": label,
+                        "kind": "other",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": f"{label} est un modèle de service cloud.",
+                    }
+                ],
+            )
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze([[_page(1, label)]])
+    concept = next(c for c in model.concepts if c.id == concept_id)
+    assert concept.kind == "other"
+    assert concept.label == label
+
+
+@pytest.mark.parametrize("bad_kind", ["service", "technology"])
+def test_invented_kind_is_rejected_with_diagnostic(bad_kind: str) -> None:
+    with pytest.raises(ValueError, match=rf"kind invalide.*c_bad.*{bad_kind}"):
+        _concept_from_raw(
+            {
+                "id": "c_bad",
+                "label": "PaaS",
+                "kind": bad_kind,
+                "pages": [1],
+                "essential": True,
+                "depends_on": [],
+                "notes": "",
+            }
+        )
+
+
+@pytest.mark.parametrize("kind", sorted(_KIND_VALUES))
+def test_all_allowed_kinds_are_accepted(kind: str) -> None:
+    concept = _concept_from_raw(
+        {
+            "id": f"c_{kind}",
+            "label": kind,
+            "kind": kind,
+            "pages": [1],
+            "essential": False,
+            "depends_on": [],
+            "notes": "",
+        }
+    )
+    assert concept.kind == kind
+
+
+def test_invalid_kind_error_lists_allowed_values() -> None:
+    with pytest.raises(ValueError) as caught:
+        _concept_from_raw(
+            {
+                "id": "c_tool",
+                "label": "outil",
+                "kind": "tool",
+                "pages": [1],
+            }
+        )
+    message = str(caught.value)
+    assert "c_tool" in message
+    assert "tool" in message
+    for allowed in _KIND_VALUES:
+        assert allowed in message
