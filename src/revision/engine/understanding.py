@@ -23,6 +23,19 @@ from src.revision.engine.models import (
 _KIND_VALUES = frozenset(
     {"definition", "formula", "method", "mechanism", "relation", "other"}
 )
+# Alias fréquents inventés par le LLM pour des notions cloud / outils.
+# Ils restent hors du modèle public ConceptKind et sont ramenés à une valeur canonique.
+_KIND_ALIASES: dict[str, str] = {
+    "service": "other",
+    "technology": "other",
+    "tool": "other",
+    "concept": "other",
+    "platform": "other",
+    "model": "other",
+    "process": "method",
+    "equation": "formula",
+    "link": "relation",
+}
 _JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
 
@@ -182,19 +195,50 @@ def _load_json_object(raw: str) -> dict[str, Any]:
     return data
 
 
+def _normalize_kind(raw_kind: object) -> tuple[str | None, str | None]:
+    """Retourne (kind_canonique, alias_d_origine_ou_None)."""
+    if not isinstance(raw_kind, str):
+        return None, None
+    cleaned = raw_kind.strip()
+    if not cleaned:
+        return None, None
+    lowered = cleaned.casefold()
+    if lowered in _KIND_VALUES:
+        return lowered, None
+    aliased = _KIND_ALIASES.get(lowered)
+    if aliased is not None:
+        return aliased, cleaned
+    return None, cleaned
+
+
+def _notes_with_origin(notes: str, origin_kind: str | None) -> str:
+    """Conserve l'information du kind LLM d'origine sans écraser les notes."""
+    base = notes.strip()
+    if not origin_kind:
+        return base
+    marker = f"Catégorie LLM d'origine : {origin_kind}"
+    if marker.casefold() in base.casefold():
+        return base
+    if not base:
+        return marker
+    return f"{base} ({marker})"
+
+
 def _concept_from_raw(raw: dict[str, Any]) -> Concept:
     concept_id = str(raw.get("id") or "").strip() or "(inconnu)"
-    kind = raw.get("kind")
-    if kind not in _KIND_VALUES:
+    kind, origin_kind = _normalize_kind(raw.get("kind"))
+    if kind is None or kind not in _KIND_VALUES:
+        received = raw.get("kind")
         allowed = ", ".join(sorted(_KIND_VALUES))
         raise ValueError(
-            f"kind invalide pour le concept {concept_id!r} : reçu {kind!r}. "
+            f"kind invalide pour le concept {concept_id!r} : reçu {received!r}. "
             f"Valeurs autorisées : {allowed}."
         )
     pages = _int_list(raw.get("pages"))
     depends_on = raw.get("depends_on") or []
     if not isinstance(depends_on, list):
         raise ValueError("JSON de compréhension invalide.")
+    notes = _notes_with_origin(str(raw.get("notes") or ""), origin_kind)
     return Concept(
         id=str(raw["id"]).strip(),
         label=str(raw["label"]).strip(),
@@ -202,7 +246,7 @@ def _concept_from_raw(raw: dict[str, Any]) -> Concept:
         pages=pages,
         essential=bool(raw.get("essential", False)),
         depends_on=[str(item).strip() for item in depends_on if str(item).strip()],
-        notes=str(raw.get("notes") or "").strip(),
+        notes=notes,
     )
 
 

@@ -362,20 +362,61 @@ def test_cloud_service_notions_accepted_with_kind_other(label: str, concept_id: 
     assert concept.label == label
 
 
-@pytest.mark.parametrize("bad_kind", ["service", "technology"])
-def test_invented_kind_is_rejected_with_diagnostic(bad_kind: str) -> None:
-    with pytest.raises(ValueError, match=rf"kind invalide.*c_bad.*{bad_kind}"):
-        _concept_from_raw(
-            {
-                "id": "c_bad",
-                "label": "PaaS",
-                "kind": bad_kind,
-                "pages": [1],
-                "essential": True,
-                "depends_on": [],
-                "notes": "",
-            }
-        )
+@pytest.mark.parametrize(
+    ("raw_kind", "expected"),
+    [
+        ("service", "other"),
+        ("Service", "other"),
+        ("technology", "other"),
+        ("tool", "other"),
+        ("platform", "other"),
+        ("process", "method"),
+        ("equation", "formula"),
+        ("link", "relation"),
+    ],
+)
+def test_kind_aliases_are_normalized(raw_kind: str, expected: str) -> None:
+    concept = _concept_from_raw(
+        {
+            "id": "c_alias",
+            "label": "PaaS",
+            "kind": raw_kind,
+            "pages": [1],
+            "essential": True,
+            "depends_on": [],
+            "notes": "Modèle cloud.",
+        }
+    )
+    assert concept.kind == expected
+    assert "Catégorie LLM d'origine :" in concept.notes
+    assert raw_kind in concept.notes or raw_kind.casefold() in concept.notes.casefold()
+    assert "Modèle cloud." in concept.notes
+
+
+def test_paas_with_kind_service_is_accepted_as_other() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Cloud"],
+                concepts=[
+                    {
+                        "id": "c_paas",
+                        "label": "PaaS",
+                        "kind": "service",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Platform as a Service.",
+                    }
+                ],
+            )
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze([[_page(1, "PaaS")]])
+    concept = next(c for c in model.concepts if c.id == "c_paas")
+    assert concept.kind == "other"
+    assert concept.label == "PaaS"
+    assert "service" in concept.notes.casefold()
 
 
 @pytest.mark.parametrize("kind", sorted(_KIND_VALUES))
@@ -392,20 +433,21 @@ def test_all_allowed_kinds_are_accepted(kind: str) -> None:
         }
     )
     assert concept.kind == kind
+    assert concept.notes == ""
 
 
 def test_invalid_kind_error_lists_allowed_values() -> None:
     with pytest.raises(ValueError) as caught:
         _concept_from_raw(
             {
-                "id": "c_tool",
+                "id": "c_weird",
                 "label": "outil",
-                "kind": "tool",
+                "kind": "banana",
                 "pages": [1],
             }
         )
     message = str(caught.value)
-    assert "c_tool" in message
-    assert "tool" in message
+    assert "c_weird" in message
+    assert "banana" in message
     for allowed in _KIND_VALUES:
         assert allowed in message
