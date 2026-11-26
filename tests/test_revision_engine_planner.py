@@ -1,4 +1,4 @@
-"""Tests du PedagogicalPlanner Smart Revision V2."""
+"""Tests du PedagogicalPlanner Smart Revision V2 (fiche unique, sans questions)."""
 
 from __future__ import annotations
 
@@ -7,13 +7,18 @@ import json
 import pytest
 
 from src.revision.engine.llm_guard import (
+    LEGACY_STORE_LEVEL,
+    LEGACY_STORE_SHEET_TYPE,
     LlmBudgetGuard,
-    MAX_CHAPTERS_COMPLETE,
-    MAX_CHAPTERS_SHORT,
+    MAX_CHAPTERS,
     TOKENS_PLAN,
 )
 from src.revision.engine.models import Concept, CourseModel, CourseRelation
-from src.revision.engine.planner import PedagogicalPlanner
+from src.revision.engine.planner import (
+    PedagogicalPlanner,
+    _heuristic_plan,
+    _topo_sort,
+)
 
 
 class ScriptedLLM:
@@ -92,60 +97,67 @@ def _course_model() -> CourseModel:
     )
 
 
-def _plan_payload(chapters: list[dict], sheet_type: str = "short") -> str:
+def _plan_payload(chapters: list[dict]) -> str:
     return json.dumps(
         {
             "language": "fr",
             "level": "beginner",
-            "sheet_type": sheet_type,
+            "sheet_type": "short",
             "chapters": chapters,
         },
         ensure_ascii=False,
     )
 
 
-def test_short_plan_respects_chapter_cap_and_essentials() -> None:
-    llm = ScriptedLLM(
-        [
-            _plan_payload(
-                [
-                    {
-                        "index": 0,
-                        "title": "Les variables",
-                        "objectives": [
-                            {
-                                "text": "Comprendre une variable",
-                                "concept_ids": ["c_var"],
-                            }
-                        ],
-                        "concept_ids": ["c_var"],
-                        "page_refs": [1],
-                        "needs_example": True,
-                        "needs_table": False,
-                        "needs_questions": False,
-                        "depth": "short",
-                    },
-                    {
-                        "index": 1,
-                        "title": "Les fonctions",
-                        "objectives": [
-                            {
-                                "text": "Utiliser une fonction",
-                                "concept_ids": ["c_fun"],
-                            }
-                        ],
-                        "concept_ids": ["c_fun", "c_rec"],
-                        "page_refs": [2, 3],
-                        "needs_example": True,
-                        "needs_table": False,
-                        "needs_questions": False,
-                        "depth": "short",
-                    },
-                ],
-                sheet_type="short",
-            )
-        ]
-    )
+def _full_coverage_chapters(*, needs_questions: bool = False, depth: str = "complete") -> list[dict]:
+    return [
+        {
+            "index": 0,
+            "title": "Fondations : variables",
+            "objectives": [
+                {"text": "Maîtriser les variables", "concept_ids": ["c_var"]}
+            ],
+            "concept_ids": ["c_var", "c_tip"],
+            "page_refs": [1, 3],
+            "needs_example": True,
+            "needs_table": False,
+            "needs_questions": needs_questions,
+            "depth": depth,
+        },
+        {
+            "index": 1,
+            "title": "Fonctions et dépendances",
+            "objectives": [
+                {
+                    "text": "Relier fonctions et variables",
+                    "concept_ids": ["c_fun", "c_var"],
+                }
+            ],
+            "concept_ids": ["c_fun"],
+            "page_refs": [2],
+            "needs_example": True,
+            "needs_table": True,
+            "needs_questions": needs_questions,
+            "depth": depth,
+        },
+        {
+            "index": 2,
+            "title": "Récursivité",
+            "objectives": [
+                {"text": "Expliquer la récursivité", "concept_ids": ["c_rec"]}
+            ],
+            "concept_ids": ["c_rec"],
+            "page_refs": [3],
+            "needs_example": True,
+            "needs_table": False,
+            "needs_questions": needs_questions,
+            "depth": depth,
+        },
+    ]
+
+
+def test_plan_covers_all_concepts_and_forces_legacy_store_fields() -> None:
+    llm = ScriptedLLM([_plan_payload(_full_coverage_chapters(needs_questions=True, depth="short"))])
     guard = LlmBudgetGuard()
     plan = PedagogicalPlanner(llm, guard).plan(
         _course_model(),
@@ -154,86 +166,30 @@ def test_short_plan_respects_chapter_cap_and_essentials() -> None:
         language="fr",
     )
 
-    assert plan.sheet_type == "short"
-    assert len(plan.chapters) <= MAX_CHAPTERS_SHORT
-    assert all(ch.depth == "short" for ch in plan.chapters)
+    assert plan.sheet_type == LEGACY_STORE_SHEET_TYPE
+    assert plan.level == LEGACY_STORE_LEVEL
+    assert len(plan.chapters) <= MAX_CHAPTERS
+    assert all(ch.depth == "complete" for ch in plan.chapters)
     assert all(not ch.needs_questions for ch in plan.chapters)
     covered = {cid for ch in plan.chapters for cid in ch.concept_ids}
-    assert {"c_var", "c_fun", "c_rec"} <= covered
+    assert covered == {"c_var", "c_fun", "c_rec", "c_tip"}
     assert llm.calls == 1
     assert llm.token_budgets == [TOKENS_PLAN]
     assert guard.calls == 1
     assert guard.reserved_tokens == TOKENS_PLAN
 
 
-def test_complete_plan_is_deeper_than_short() -> None:
-    llm = ScriptedLLM(
-        [
-            _plan_payload(
-                [
-                    {
-                        "index": 0,
-                        "title": "Fondations : variables",
-                        "objectives": [
-                            {"text": "Maîtriser les variables", "concept_ids": ["c_var"]}
-                        ],
-                        "concept_ids": ["c_var"],
-                        "page_refs": [1],
-                        "needs_example": True,
-                        "needs_table": False,
-                        "needs_questions": True,
-                        "depth": "complete",
-                    },
-                    {
-                        "index": 1,
-                        "title": "Fonctions et dépendances",
-                        "objectives": [
-                            {
-                                "text": "Relier fonctions et variables",
-                                "concept_ids": ["c_fun", "c_var"],
-                            }
-                        ],
-                        "concept_ids": ["c_fun"],
-                        "page_refs": [2],
-                        "needs_example": True,
-                        "needs_table": True,
-                        "needs_questions": True,
-                        "depth": "complete",
-                    },
-                    {
-                        "index": 2,
-                        "title": "Récursivité",
-                        "objectives": [
-                            {
-                                "text": "Expliquer la récursivité",
-                                "concept_ids": ["c_rec"],
-                            }
-                        ],
-                        "concept_ids": ["c_rec"],
-                        "page_refs": [3],
-                        "needs_example": True,
-                        "needs_table": False,
-                        "needs_questions": True,
-                        "depth": "complete",
-                    },
-                ],
-                sheet_type="complete",
-            )
-        ]
-    )
-    plan = PedagogicalPlanner(ScriptedLLM(llm.replies), LlmBudgetGuard()).plan(
+def test_plan_ignores_requested_sheet_type_and_level() -> None:
+    llm = ScriptedLLM([_plan_payload(_full_coverage_chapters())])
+    plan = PedagogicalPlanner(llm, LlmBudgetGuard()).plan(
         _course_model(),
-        sheet_type="complete",
+        sheet_type="short",
         level="advanced",
         language="fr",
     )
-
-    assert plan.sheet_type == "complete"
-    assert len(plan.chapters) <= MAX_CHAPTERS_COMPLETE
-    assert all(ch.depth == "complete" for ch in plan.chapters)
-    assert any(ch.needs_questions for ch in plan.chapters)
+    assert plan.sheet_type == LEGACY_STORE_SHEET_TYPE
+    assert plan.level == LEGACY_STORE_LEVEL
     assert any(ch.needs_table for ch in plan.chapters)
-    assert len(plan.chapters) >= 2
 
 
 def test_plan_respects_concept_dependencies_order() -> None:
@@ -245,12 +201,12 @@ def test_plan_respects_concept_dependencies_order() -> None:
                         "index": 0,
                         "title": "Variables d'abord",
                         "objectives": [],
-                        "concept_ids": ["c_var"],
+                        "concept_ids": ["c_var", "c_tip"],
                         "page_refs": [1],
                         "needs_example": False,
                         "needs_table": False,
                         "needs_questions": False,
-                        "depth": "short",
+                        "depth": "complete",
                     },
                     {
                         "index": 1,
@@ -261,7 +217,7 @@ def test_plan_respects_concept_dependencies_order() -> None:
                         "needs_example": False,
                         "needs_table": False,
                         "needs_questions": False,
-                        "depth": "short",
+                        "depth": "complete",
                     },
                     {
                         "index": 2,
@@ -272,7 +228,7 @@ def test_plan_respects_concept_dependencies_order() -> None:
                         "needs_example": False,
                         "needs_table": False,
                         "needs_questions": False,
-                        "depth": "short",
+                        "depth": "complete",
                     },
                 ]
             )
@@ -280,8 +236,6 @@ def test_plan_respects_concept_dependencies_order() -> None:
     )
     plan = PedagogicalPlanner(llm, LlmBudgetGuard()).plan(
         _course_model(),
-        sheet_type="short",
-        level="beginner",
         language="fr",
     )
     positions = {}
@@ -305,72 +259,85 @@ def test_invalid_dependency_order_is_rejected() -> None:
                         "needs_example": False,
                         "needs_table": False,
                         "needs_questions": False,
-                        "depth": "short",
+                        "depth": "complete",
                     },
                     {
                         "index": 1,
                         "title": "Variables après",
                         "objectives": [],
-                        "concept_ids": ["c_var"],
+                        "concept_ids": ["c_var", "c_fun", "c_tip"],
                         "page_refs": [1],
                         "needs_example": False,
                         "needs_table": False,
                         "needs_questions": False,
-                        "depth": "short",
+                        "depth": "complete",
                     },
                 ]
             )
         ]
     )
     with pytest.raises(ValueError, match="dépendances"):
-        PedagogicalPlanner(llm, LlmBudgetGuard()).plan(
-            _course_model(),
-            sheet_type="short",
-            level="beginner",
-            language="fr",
-        )
+        PedagogicalPlanner(llm, LlmBudgetGuard()).plan(_course_model(), language="fr")
 
 
-def test_too_many_chapters_raises_without_silent_truncation() -> None:
+def test_omitted_concepts_are_rejected() -> None:
+    llm = ScriptedLLM(
+        [
+            _plan_payload(
+                [
+                    {
+                        "index": 0,
+                        "title": "Essentiels seulement",
+                        "objectives": [],
+                        "concept_ids": ["c_var", "c_fun", "c_rec"],
+                        "page_refs": [1, 2, 3],
+                        "needs_example": True,
+                        "needs_table": False,
+                        "needs_questions": False,
+                        "depth": "complete",
+                    }
+                ]
+            )
+        ]
+    )
+    with pytest.raises(ValueError, match="concepts"):
+        PedagogicalPlanner(llm, LlmBudgetGuard()).plan(_course_model(), language="fr")
+
+
+def test_too_many_chapters_falls_back_to_heuristic_without_losing_concepts() -> None:
     chapters = [
         {
             "index": i,
             "title": f"Chapitre {i}",
             "objectives": [],
-            "concept_ids": ["c_var"] if i == 0 else ["c_fun"] if i == 1 else ["c_rec"],
+            "concept_ids": ["c_var"] if i == 0 else ["c_fun"] if i == 1 else ["c_rec"] if i == 2 else ["c_tip"],
             "page_refs": [1],
             "needs_example": False,
             "needs_table": False,
             "needs_questions": False,
-            "depth": "short",
+            "depth": "complete",
         }
-        for i in range(MAX_CHAPTERS_SHORT + 1)
+        for i in range(MAX_CHAPTERS + 1)
     ]
-    llm = ScriptedLLM([_plan_payload(chapters, sheet_type="short")])
-    with pytest.raises(ValueError, match="moins de pages"):
-        PedagogicalPlanner(llm, LlmBudgetGuard()).plan(
-            _course_model(),
-            sheet_type="short",
-            level="beginner",
-            language="fr",
-        )
+    # Duplique les ids → invalide ; le planner bascule sur l'heuristique.
+    llm = ScriptedLLM([_plan_payload(chapters)])
+    plan = PedagogicalPlanner(llm, LlmBudgetGuard()).plan(_course_model(), language="fr")
+    covered = {cid for ch in plan.chapters for cid in ch.concept_ids}
+    assert covered == {"c_var", "c_fun", "c_rec", "c_tip"}
+    assert 1 <= len(plan.chapters) <= MAX_CHAPTERS
+    assert plan.sheet_type == LEGACY_STORE_SHEET_TYPE
 
 
 def test_heuristic_fallback_after_invalid_json() -> None:
     llm = ScriptedLLM(["not-json", "still-bad"])
     guard = LlmBudgetGuard()
-    plan = PedagogicalPlanner(llm, guard).plan(
-        _course_model(),
-        sheet_type="short",
-        level="beginner",
-        language="fr",
-    )
+    plan = PedagogicalPlanner(llm, guard).plan(_course_model(), language="fr")
 
-    assert plan.sheet_type == "short"
-    assert 1 <= len(plan.chapters) <= MAX_CHAPTERS_SHORT
+    assert plan.sheet_type == LEGACY_STORE_SHEET_TYPE
+    assert plan.level == LEGACY_STORE_LEVEL
+    assert 1 <= len(plan.chapters) <= MAX_CHAPTERS
     covered = {cid for ch in plan.chapters for cid in ch.concept_ids}
-    assert {"c_var", "c_fun", "c_rec"} <= covered
-    # Retry consommé (2) ; pas d'appel LLM supplémentaire pour le fallback.
+    assert covered == {"c_var", "c_fun", "c_rec", "c_tip"}
     assert llm.calls == 2
     assert guard.calls == 2
     positions = {}
@@ -384,77 +351,141 @@ def test_fallback_impossible_on_empty_model_reraises() -> None:
     llm = ScriptedLLM(["{}", "encore non"])
     empty = CourseModel()
     with pytest.raises(ValueError, match="JSON|plan"):
-        PedagogicalPlanner(llm, LlmBudgetGuard()).plan(
-            empty,
-            sheet_type="short",
-            level="beginner",
-            language="fr",
+        PedagogicalPlanner(llm, LlmBudgetGuard()).plan(empty, language="fr")
+
+
+def test_prompt_forbids_questions_and_requires_full_coverage() -> None:
+    llm = ScriptedLLM([_plan_payload(_full_coverage_chapters())])
+    PedagogicalPlanner(llm, LlmBudgetGuard()).plan(_course_model(), language="fr")
+    # ScriptedLLM ne stocke pas le prompt ; on reconstruit via un LLM enregistreur.
+    class CapturingLLM(ScriptedLLM):
+        def __init__(self) -> None:
+            super().__init__([_plan_payload(_full_coverage_chapters())])
+            self.prompts: list[str] = []
+
+        def generate(self, prompt: str, max_new_tokens: int = 512) -> str:
+            self.prompts.append(prompt)
+            return super().generate(prompt, max_new_tokens=max_new_tokens)
+
+    capturing = CapturingLLM()
+    PedagogicalPlanner(capturing, LlmBudgetGuard()).plan(_course_model(), language="fr")
+    prompt = capturing.prompts[0]
+    assert "needs_questions=true" in prompt or "Interdit : questions" in prompt
+    assert "TOUS les concepts" in prompt or "tous les concepts" in prompt.casefold()
+
+
+def _cyclic_course_ab() -> CourseModel:
+    return CourseModel(
+        themes=["Cycle"],
+        concepts=[
+            Concept(
+                id="c_a",
+                label="A",
+                kind="other",
+                pages=[1],
+                essential=True,
+                depends_on=["c_b"],
+                notes="dépend de B",
+            ),
+            Concept(
+                id="c_b",
+                label="B",
+                kind="other",
+                pages=[1],
+                essential=True,
+                depends_on=["c_a"],
+                notes="dépend de A",
+            ),
+        ],
+        essential_concept_ids=["c_a", "c_b"],
+    )
+
+
+def _cyclic_course_three() -> CourseModel:
+    return CourseModel(
+        themes=["Cycle"],
+        concepts=[
+            Concept(
+                id="c_a",
+                label="A",
+                kind="other",
+                pages=[1],
+                essential=True,
+                depends_on=["c_c"],
+                notes="A",
+            ),
+            Concept(
+                id="c_b",
+                label="B",
+                kind="other",
+                pages=[1],
+                essential=True,
+                depends_on=["c_a"],
+                notes="B",
+            ),
+            Concept(
+                id="c_c",
+                label="C",
+                kind="other",
+                pages=[1],
+                essential=True,
+                depends_on=["c_b"],
+                notes="C",
+            ),
+        ],
+        essential_concept_ids=["c_a", "c_b", "c_c"],
+    )
+
+
+def test_simple_cycle_a_b_a_is_rejected() -> None:
+    with pytest.raises(ValueError, match="dépendances cycliques"):
+        PedagogicalPlanner(ScriptedLLM(["{}"]), LlmBudgetGuard()).plan(
+            _cyclic_course_ab(), language="fr"
         )
 
 
-def test_short_and_complete_differ_for_same_course() -> None:
-    short_json = _plan_payload(
-        [
-            {
-                "index": 0,
-                "title": "Essentiels",
-                "objectives": [],
-                "concept_ids": ["c_var", "c_fun", "c_rec"],
-                "page_refs": [1, 2, 3],
-                "needs_example": True,
-                "needs_table": False,
-                "needs_questions": False,
-                "depth": "short",
-            }
-        ],
-        sheet_type="short",
-    )
-    complete_json = _plan_payload(
-        [
-            {
-                "index": 0,
-                "title": "Variables",
-                "objectives": [],
-                "concept_ids": ["c_var"],
-                "page_refs": [1],
-                "needs_example": True,
-                "needs_table": False,
-                "needs_questions": True,
-                "depth": "complete",
-            },
-            {
-                "index": 1,
-                "title": "Fonctions",
-                "objectives": [],
-                "concept_ids": ["c_fun"],
-                "page_refs": [2],
-                "needs_example": True,
-                "needs_table": True,
-                "needs_questions": True,
-                "depth": "complete",
-            },
-            {
-                "index": 2,
-                "title": "Récursivité",
-                "objectives": [],
-                "concept_ids": ["c_rec"],
-                "page_refs": [3],
-                "needs_example": True,
-                "needs_table": False,
-                "needs_questions": True,
-                "depth": "complete",
-            },
-        ],
-        sheet_type="complete",
-    )
-    short_plan = PedagogicalPlanner(ScriptedLLM([short_json]), LlmBudgetGuard()).plan(
-        _course_model(), sheet_type="short", level="beginner", language="fr"
-    )
-    complete_plan = PedagogicalPlanner(
-        ScriptedLLM([complete_json]), LlmBudgetGuard()
-    ).plan(_course_model(), sheet_type="complete", level="beginner", language="fr")
+def test_three_concept_cycle_is_rejected() -> None:
+    with pytest.raises(ValueError, match="dépendances cycliques"):
+        PedagogicalPlanner(ScriptedLLM(["{}"]), LlmBudgetGuard()).plan(
+            _cyclic_course_three(), language="fr"
+        )
 
-    assert short_plan.sheet_type != complete_plan.sheet_type
-    assert len(complete_plan.chapters) >= len(short_plan.chapters)
-    assert any(ch.needs_questions for ch in complete_plan.chapters)
-    assert all(not ch.needs_questions for ch in short_plan.chapters)
+
+def test_cyclic_graph_does_not_call_llm() -> None:
+    llm = ScriptedLLM([_plan_payload(_full_coverage_chapters())])
+    with pytest.raises(ValueError, match="dépendances cycliques"):
+        PedagogicalPlanner(llm, LlmBudgetGuard()).plan(
+            _cyclic_course_ab(), language="fr"
+        )
+    assert llm.calls == 0
+
+
+def test_valid_dependency_graph_keeps_topo_order_and_coverage() -> None:
+    llm = ScriptedLLM([_plan_payload(_full_coverage_chapters())])
+    plan = PedagogicalPlanner(llm, LlmBudgetGuard()).plan(
+        _course_model(), language="fr"
+    )
+    covered = {cid for ch in plan.chapters for cid in ch.concept_ids}
+    assert covered == {"c_var", "c_fun", "c_rec", "c_tip"}
+    positions = {}
+    for chapter in plan.chapters:
+        for cid in chapter.concept_ids:
+            positions.setdefault(cid, chapter.index)
+    assert positions["c_var"] <= positions["c_fun"] <= positions["c_rec"]
+
+    ordered = _topo_sort(list(_course_model().concepts))
+    ids = [c.id for c in ordered]
+    assert ids.index("c_var") < ids.index("c_fun") < ids.index("c_rec")
+    assert set(ids) == {"c_var", "c_fun", "c_rec", "c_tip"}
+
+
+def test_heuristic_fallback_on_cyclic_graph_raises_without_masking() -> None:
+    course = _cyclic_course_ab()
+    with pytest.raises(ValueError, match="dépendances cycliques"):
+        _heuristic_plan(course, "fr")
+
+    planner = PedagogicalPlanner(ScriptedLLM(["not-json"]), LlmBudgetGuard())
+    unrelated = ValueError("JSON de planification invalide.")
+    with pytest.raises(ValueError, match="dépendances cycliques") as caught:
+        planner._fallback_or_raise(course, "fr", unrelated)
+    assert "JSON" not in str(caught.value)

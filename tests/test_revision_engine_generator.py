@@ -8,10 +8,11 @@ import pytest
 
 from src.revision.engine.generator import OriginalContentGenerator, _build_chapter_prompt
 from src.revision.engine.llm_guard import (
+    LEGACY_STORE_LEVEL,
+    LEGACY_STORE_SHEET_TYPE,
     LlmBudgetGuard,
     MAX_LLM_CALLS,
-    TOKENS_CHAPTER_COMPLETE,
-    TOKENS_CHAPTER_SHORT,
+    TOKENS_CHAPTER,
 )
 from src.revision.engine.models import (
     ChapterPlan,
@@ -132,12 +133,11 @@ def _course() -> CourseModel:
     )
 
 
-def _plan(sheet_type: str = "short", level: str = "beginner", language: str = "fr") -> PedagogicalPlan:
-    depth = "short" if sheet_type == "short" else "complete"
+def _plan(language: str = "fr", *, needs_table: bool = False) -> PedagogicalPlan:
     return PedagogicalPlan(
         language=language,
-        level=level,
-        sheet_type=sheet_type,  # type: ignore[arg-type]
+        level=LEGACY_STORE_LEVEL,
+        sheet_type=LEGACY_STORE_SHEET_TYPE,
         chapters=[
             ChapterPlan(
                 index=0,
@@ -149,8 +149,8 @@ def _plan(sheet_type: str = "short", level: str = "beginner", language: str = "f
                 page_refs=[1],
                 needs_example=True,
                 needs_table=False,
-                needs_questions=sheet_type == "complete",
-                depth=depth,  # type: ignore[arg-type]
+                needs_questions=False,
+                depth="complete",
             ),
             ChapterPlan(
                 index=1,
@@ -161,9 +161,9 @@ def _plan(sheet_type: str = "short", level: str = "beginner", language: str = "f
                 concept_ids=["c_fun"],
                 page_refs=[2],
                 needs_example=True,
-                needs_table=sheet_type == "complete",
-                needs_questions=sheet_type == "complete",
-                depth=depth,  # type: ignore[arg-type]
+                needs_table=needs_table,
+                needs_questions=False,
+                depth="complete",
             ),
         ],
     )
@@ -301,11 +301,6 @@ def _complete_chapter_var() -> str:
                 "source_pages": [1],
             },
             {
-                "type": "question",
-                "text": "Pourquoi nommer une valeur ?",
-                "source_pages": [1],
-            },
-            {
                 "type": "synthesis",
                 "text": "La variable est la brique de base avant les fonctions.",
                 "source_pages": [1],
@@ -347,11 +342,6 @@ def _complete_chapter_fun() -> str:
                 "source_pages": [2],
             },
             {
-                "type": "question",
-                "text": "Quel lien unit fonction et variable ?",
-                "source_pages": [2],
-            },
-            {
                 "type": "synthesis",
                 "text": "Les fonctions organisent les comportements autour des variables.",
                 "source_pages": [2],
@@ -365,7 +355,7 @@ def test_generates_chapters_in_plan_order_covering_essentials() -> None:
     guard = LlmBudgetGuard()
     document = OriginalContentGenerator(llm, guard).generate(
         _course(),
-        _plan("short"),
+        _plan(),
         filename="cours.pdf",
         page_start=1,
         page_end=2,
@@ -376,72 +366,55 @@ def test_generates_chapters_in_plan_order_covering_essentials() -> None:
     assert [ch.index for ch in document.chapters] == [0, 1]
     covered = {cid for ch in document.chapters for cid in ch.concept_ids_covered}
     assert {"c_var", "c_fun"} <= covered
+    assert document.level == LEGACY_STORE_LEVEL
+    assert document.sheet_type == LEGACY_STORE_SHEET_TYPE
     assert llm.calls == 2
-    assert llm.token_budgets == [TOKENS_CHAPTER_SHORT, TOKENS_CHAPTER_SHORT]
+    assert llm.token_budgets == [TOKENS_CHAPTER, TOKENS_CHAPTER]
     assert guard.calls == 2
-    assert guard.reserved_tokens == 2 * TOKENS_CHAPTER_SHORT
+    assert guard.reserved_tokens == 2 * TOKENS_CHAPTER
 
 
-def test_short_and_complete_differ_in_budget_prompt_and_structure() -> None:
-    short_llm = ScriptedLLM([_short_chapter_var(), _short_chapter_fun()])
-    complete_llm = ScriptedLLM([_complete_chapter_var(), _complete_chapter_fun()])
-
-    short_doc = OriginalContentGenerator(short_llm, LlmBudgetGuard()).generate(
+def test_complete_sheet_includes_rich_blocks_without_questions() -> None:
+    llm = ScriptedLLM([_complete_chapter_var(), _complete_chapter_fun()])
+    document = OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
         _course(),
-        _plan("short"),
-        filename="cours.pdf",
-        page_start=1,
-        page_end=2,
-        source_pages=_pages(),
-    )
-    complete_doc = OriginalContentGenerator(complete_llm, LlmBudgetGuard()).generate(
-        _course(),
-        _plan("complete"),
+        _plan(needs_table=True),
         filename="cours.pdf",
         page_start=1,
         page_end=2,
         source_pages=_pages(),
     )
 
-    assert short_llm.token_budgets == [TOKENS_CHAPTER_SHORT, TOKENS_CHAPTER_SHORT]
-    assert complete_llm.token_budgets == [
-        TOKENS_CHAPTER_COMPLETE,
-        TOKENS_CHAPTER_COMPLETE,
-    ]
-    assert "fiche short" in short_llm.prompts[0].casefold() or "short" in short_llm.prompts[0].casefold()
-    assert "complete" in complete_llm.prompts[0].casefold()
-    short_blocks = sum(len(ch.blocks) for ch in short_doc.chapters)
-    complete_blocks = sum(len(ch.blocks) for ch in complete_doc.chapters)
-    assert complete_blocks > short_blocks
+    assert llm.token_budgets == [TOKENS_CHAPTER, TOKENS_CHAPTER]
+    assert "complète" in llm.prompts[0].casefold() or "complete" in llm.prompts[0].casefold()
+    assert "question" in llm.prompts[0].casefold()
+    assert "interdit" in llm.prompts[0].casefold()
     assert any(
         isinstance(block, ExampleBlock) and block.origin == "pedagogical_addition"
-        for ch in complete_doc.chapters
+        for ch in document.chapters
         for block in ch.blocks
     )
-    assert any(block.type == "question" for ch in complete_doc.chapters for block in ch.blocks)
-    assert all(block.type != "question" for ch in short_doc.chapters for block in ch.blocks)
+    assert all(block.type != "question" for ch in document.chapters for block in ch.blocks)
 
 
-def test_prompt_adapts_level_and_language() -> None:
+def test_prompt_adapts_language_only() -> None:
     llm = ScriptedLLM([_short_chapter_var(), _short_chapter_fun()])
     OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
         _course(),
-        _plan("short", level="advanced", language="en"),
+        _plan(language="en"),
         filename="cours.pdf",
         page_start=1,
         page_end=2,
         source_pages=_pages(),
     )
     prompt = llm.prompts[0]
-    assert "advanced" in prompt.casefold() or "avanc" in prompt.casefold()
-    assert "english" in prompt.casefold() or "anglais" in prompt.casefold() or "en" in prompt.casefold()
-
+    assert "english" in prompt.casefold() or "write entirely in english" in prompt.casefold()
 
 def test_distinguishes_course_and_pedagogical_examples() -> None:
     llm = ScriptedLLM([_short_chapter_var(), _short_chapter_fun()])
     document = OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
         _course(),
-        _plan("short"),
+        _plan(),
         filename="cours.pdf",
         page_start=1,
         page_end=2,
@@ -456,6 +429,36 @@ def test_distinguishes_course_and_pedagogical_examples() -> None:
     origins = {ex.origin for ex in examples}
     assert "from_course" in origins
     assert "pedagogical_addition" in origins
+
+
+def test_rejects_question_blocks() -> None:
+    bad = _chapter_json(
+        index=0,
+        title="Variables",
+        concept_ids=["c_var"],
+        blocks=[
+            {
+                "type": "paragraph",
+                "text": "On introduit la notion de variable pour nommer une information.",
+                "source_pages": [1],
+            },
+            {
+                "type": "question",
+                "text": "Pourquoi nommer une valeur ?",
+                "source_pages": [1],
+            },
+        ],
+    )
+    llm = ScriptedLLM([bad, bad])
+    with pytest.raises(ValueError, match="question"):
+        OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
+            _course(),
+            _plan(),
+            filename="cours.pdf",
+            page_start=1,
+            page_end=2,
+            source_pages=_pages(),
+        )
 
 
 def test_rejects_invented_url_attributed_to_source() -> None:
@@ -480,7 +483,7 @@ def test_rejects_invented_url_attributed_to_source() -> None:
     with pytest.raises(ValueError, match="invent|URL|interdit"):
         OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
             _course(),
-            _plan("short"),
+            _plan(),
             filename="cours.pdf",
             page_start=1,
             page_end=2,
@@ -505,7 +508,7 @@ def test_rejects_invented_numeric_fact_not_in_source() -> None:
     with pytest.raises(ValueError, match="invent"):
         OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
             _course(),
-            _plan("short"),
+            _plan(),
             filename="cours.pdf",
             page_start=1,
             page_end=2,
@@ -535,7 +538,7 @@ def test_keeps_contradiction_without_invented_resolution() -> None:
     with pytest.raises(ValueError, match="contradiction|résolution|trancher"):
         OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
             _course(),
-            _plan("short"),
+            _plan(),
             filename="cours.pdf",
             page_start=1,
             page_end=2,
@@ -549,7 +552,7 @@ def test_invalid_json_retries_then_fails_without_partial_document() -> None:
     with pytest.raises(ValueError, match="JSON"):
         OriginalContentGenerator(llm, guard).generate(
             _course(),
-            _plan("short"),
+            _plan(),
             filename="cours.pdf",
             page_start=1,
             page_end=2,
@@ -557,7 +560,7 @@ def test_invalid_json_retries_then_fails_without_partial_document() -> None:
         )
     assert llm.calls == 2
     assert guard.calls == 2
-    assert guard.reserved_tokens == 2 * TOKENS_CHAPTER_SHORT
+    assert guard.reserved_tokens == 2 * TOKENS_CHAPTER
 
 
 def test_incomplete_second_chapter_does_not_return_partial_success() -> None:
@@ -571,7 +574,7 @@ def test_incomplete_second_chapter_does_not_return_partial_success() -> None:
     with pytest.raises(ValueError, match="incomplet|vide|chapitre"):
         OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
             _course(),
-            _plan("short"),
+            _plan(),
             filename="cours.pdf",
             page_start=1,
             page_end=2,
@@ -596,7 +599,7 @@ def test_missing_essential_concept_is_rejected() -> None:
     with pytest.raises(ValueError, match="concept|essentiel"):
         OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
             _course(),
-            _plan("short"),
+            _plan(),
             filename="cours.pdf",
             page_start=1,
             page_end=2,
@@ -612,7 +615,7 @@ def test_budget_ceiling_is_enforced() -> None:
     with pytest.raises(ValueError, match="appels"):
         OriginalContentGenerator(llm, guard).generate(
             _course(),
-            _plan("short"),
+            _plan(),
             filename="cours.pdf",
             page_start=1,
             page_end=2,
@@ -643,7 +646,7 @@ def test_near_copy_of_source_paragraph_is_rejected() -> None:
     with pytest.raises(ValueError, match="paraphrase|copie|original"):
         OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
             _course(),
-            _plan("short"),
+            _plan(),
             filename="cours.pdf",
             page_start=1,
             page_end=2,
@@ -652,7 +655,7 @@ def test_near_copy_of_source_paragraph_is_rejected() -> None:
 
 
 def test_chapter_prompt_documents_exact_block_types_without_pipe_union() -> None:
-    plan = _plan("complete")
+    plan = _plan()
     prompt = _build_chapter_prompt(
         course=_course(),
         plan=plan,
@@ -666,6 +669,8 @@ def test_chapter_prompt_documents_exact_block_types_without_pipe_union() -> None
         not in prompt
     )
     assert "paragraph|definition|example|retain|table|diagram|synthesis|question" not in prompt
+    assert '"type":"question"' not in prompt
+    assert "Interdit : type question" in prompt or "type question" in prompt.casefold()
 
     for block_type in (
         "paragraph",
@@ -675,7 +680,6 @@ def test_chapter_prompt_documents_exact_block_types_without_pipe_union() -> None
         "table",
         "diagram",
         "synthesis",
-        "question",
     ):
         assert f'"type":"{block_type}"' in prompt
 
@@ -685,3 +689,4 @@ def test_chapter_prompt_documents_exact_block_types_without_pipe_union() -> None
     assert "rows" in prompt
     assert "concept_ids_covered" in prompt
     assert "sans Markdown" in prompt
+    assert "needs_questions=false" in prompt

@@ -7,10 +7,11 @@ import re
 from typing import Any
 
 from src.revision.engine.llm_guard import (
-    MAX_ANALYSIS_WINDOWS,
     TOKENS_UNDERSTANDING,
     LlmBudgetGuard,
+    ensure_pipeline_capacity,
     ensure_prompt_fits,
+    max_attempts_per_step,
 )
 from src.revision.engine.models import (
     Concept,
@@ -51,14 +52,24 @@ class CourseUnderstanding:
     def analyze(self, windows: list[list[CoursePage]]) -> CourseModel:
         if not isinstance(windows, list) or not windows:
             raise ValueError("Les fenêtres du cours sont invalides.")
-        if len(windows) > MAX_ANALYSIS_WINDOWS:
-            raise ValueError(
-                "Le cours sélectionné est trop volumineux. "
-                "Sélectionnez moins de pages."
-            )
         for window in windows:
             if not window:
                 raise ValueError("Les fenêtres du cours sont invalides.")
+        # Vérifie fenêtres + budget global (retries inclus) avant le premier appel LLM.
+        ensure_pipeline_capacity(windows=len(windows))
+        attempts = max_attempts_per_step()
+        need_calls = attempts * len(windows)
+        need_tokens = need_calls * TOKENS_UNDERSTANDING
+        if self.guard.remaining_calls < need_calls:
+            raise ValueError(
+                f"Le plafond d'appels LLM ({self.guard.calls + self.guard.remaining_calls}) "
+                "est atteint."
+            )
+        if self.guard.remaining_tokens < need_tokens:
+            raise ValueError(
+                f"Le plafond de tokens générés "
+                f"({self.guard.reserved_tokens + self.guard.remaining_tokens}) est atteint."
+            )
 
         partials: list[dict[str, Any]] = []
         for window in windows:
@@ -86,7 +97,11 @@ class CourseUnderstanding:
     ) -> CourseModel:
         themes: list[str] = []
         concepts_by_id: dict[str, Concept] = {}
+        # Correspondance globale alias → id canonique (chaînes same_as successives).
+        alias_map: dict[str, str] = {}
         relations: list[CourseRelation] = []
+        # Contradictions différées : appliquées après alias_map complet.
+        pending_contradictions: list[object] = []
         units = _units_from_windows(windows)
 
         for partial in partials:
@@ -96,26 +111,37 @@ class CourseUnderstanding:
 
             for raw in partial.get("concepts", []):
                 concept = _concept_from_raw(raw)
-                target_id = str(raw.get("same_as") or concept.id).strip() or concept.id
-                if target_id in concepts_by_id:
-                    _merge_into(concepts_by_id[target_id], concept, raw)
+                same_as = str(raw.get("same_as") or "").strip()
+                if same_as:
+                    canonical_id = _resolve_id(same_as, alias_map)
+                else:
+                    canonical_id = _resolve_id(concept.id, alias_map)
+
+                if canonical_id in concepts_by_id:
+                    if concept.id != canonical_id:
+                        alias_map[concept.id] = canonical_id
+                    _merge_into(concepts_by_id[canonical_id], concept, raw)
                 elif concept.id in concepts_by_id:
+                    # same_as pointe vers un id encore inconnu : conserver l'entrée existante.
                     _merge_into(concepts_by_id[concept.id], concept, raw)
                 else:
-                    # Si same_as pointe vers un id futur, on garde l'id canonique demandé.
-                    if target_id != concept.id and target_id not in concepts_by_id:
-                        concept = concept.model_copy(update={"id": target_id})
+                    # same_as vers un id futur → stocker sous l'id canonique demandé.
+                    if concept.id != canonical_id:
+                        alias_map[concept.id] = canonical_id
+                        concept = concept.model_copy(update={"id": canonical_id})
                     concepts_by_id[concept.id] = concept
 
             for raw_rel in partial.get("relations", []):
-                relation = _relation_from_raw(raw_rel)
-                relations.append(_remap_relation(relation, concepts_by_id, partial))
+                relations.append(_relation_from_raw(raw_rel))
 
             for contradiction in partial.get("contradictions", []):
-                _apply_contradiction(concepts_by_id, contradiction)
+                pending_contradictions.append(contradiction)
 
-        # Dédupliquer les relations (source, target, type) en unionnant les pages.
-        relations = _dedupe_relations(relations)
+        concepts_by_id, relations = _finalize_identity_graph(
+            concepts_by_id, relations, alias_map
+        )
+        for contradiction in pending_contradictions:
+            _apply_contradiction(concepts_by_id, contradiction, alias_map)
         concepts = list(concepts_by_id.values())
         essential_ids = [c.id for c in concepts if c.essential]
         return CourseModel(
@@ -291,10 +317,28 @@ def _merge_into(existing: Concept, incoming: Concept, raw: dict[str, Any]) -> No
         existing.notes = incoming.notes
 
 
-def _apply_contradiction(concepts: dict[str, Concept], raw: object) -> None:
+def _resolve_id(concept_id: str, alias_map: dict[str, str]) -> str:
+    """Suit la chaîne d'alias jusqu'à l'identifiant canonique."""
+    if not concept_id:
+        return concept_id
+    seen: set[str] = set()
+    current = concept_id
+    while current in alias_map and current not in seen:
+        seen.add(current)
+        current = alias_map[current]
+    return current
+
+
+def _apply_contradiction(
+    concepts: dict[str, Concept],
+    raw: object,
+    alias_map: dict[str, str] | None = None,
+) -> None:
     if not isinstance(raw, dict):
         return
     concept_id = str(raw.get("concept_id") or "").strip()
+    if alias_map is not None:
+        concept_id = _resolve_id(concept_id, alias_map)
     description = str(raw.get("description") or "").strip()
     pages = raw.get("pages")
     page_note = ""
@@ -318,12 +362,50 @@ def _apply_contradiction(concepts: dict[str, Concept], raw: object) -> None:
     concept.pages = _union_sorted(concept.pages, extra_pages)
 
 
+def _finalize_identity_graph(
+    concepts: dict[str, Concept],
+    relations: list[CourseRelation],
+    alias_map: dict[str, str],
+) -> tuple[dict[str, Concept], list[CourseRelation]]:
+    """Remappe depends_on / relations vers les ids canoniques et retire les orphelins."""
+    known = set(concepts.keys())
+
+    for concept in concepts.values():
+        remapped: list[str] = []
+        for dep in concept.depends_on:
+            resolved = _resolve_id(dep, alias_map)
+            if resolved in known and resolved != concept.id and resolved not in remapped:
+                remapped.append(resolved)
+        concept.depends_on = remapped
+
+    remapped_relations: list[CourseRelation] = []
+    for relation in relations:
+        source = _resolve_id(relation.source_id, alias_map)
+        target = _resolve_id(relation.target_id, alias_map)
+        if source not in known or target not in known:
+            continue
+        if not source or not target:
+            continue
+        remapped_relations.append(
+            CourseRelation(
+                source_id=source,
+                target_id=target,
+                relation_type=relation.relation_type,
+                pages=relation.pages,
+            )
+        )
+
+    return concepts, _dedupe_relations(remapped_relations)
+
+
 def _remap_relation(
     relation: CourseRelation,
     concepts: dict[str, Concept],
     partial: dict[str, Any],
+    alias_map: dict[str, str] | None = None,
 ) -> CourseRelation:
-    id_map: dict[str, str] = {}
+    """Remappe une relation (conservé pour compatibilité / usage local)."""
+    id_map: dict[str, str] = dict(alias_map or {})
     for raw in partial.get("concepts", []):
         if not isinstance(raw, dict):
             continue
@@ -331,13 +413,12 @@ def _remap_relation(
         same_as = str(raw.get("same_as") or "").strip()
         if cid and same_as:
             id_map[cid] = same_as
-    source = id_map.get(relation.source_id, relation.source_id)
-    target = id_map.get(relation.target_id, relation.target_id)
-    # Si le concept a été stocké sous same_as
-    if source not in concepts and relation.source_id in id_map:
-        source = id_map[relation.source_id]
-    if target not in concepts and relation.target_id in id_map:
-        target = id_map[relation.target_id]
+    source = _resolve_id(relation.source_id, id_map)
+    target = _resolve_id(relation.target_id, id_map)
+    if source not in concepts:
+        source = relation.source_id
+    if target not in concepts:
+        target = relation.target_id
     return CourseRelation(
         source_id=source,
         target_id=target,

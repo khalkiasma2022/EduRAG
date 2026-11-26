@@ -8,10 +8,15 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from src.revision.engine.coverage import (
+    coverage_failure_message,
+    validate_chapter_concept_coverage,
+)
 from src.revision.engine.llm_guard import (
-    TOKENS_CHAPTER_COMPLETE,
-    TOKENS_CHAPTER_SHORT,
+    TOKENS_CHAPTER,
     LlmBudgetGuard,
+    ensure_chapter_density,
+    ensure_generation_capacity,
     ensure_prompt_fits,
 )
 from src.revision.engine.models import (
@@ -38,23 +43,6 @@ _RESOLVING_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-_LEVEL_HINTS = {
-    "beginner": {
-        "fr": "Niveau débutant : vocabulaire simple, explications accessibles.",
-        "en": "Beginner level: simple vocabulary and accessible explanations.",
-        "ar": "مستوى مبتدئ: مفردات بسيطة وشروح ميسّرة.",
-    },
-    "intermediate": {
-        "fr": "Niveau intermédiaire : vocabulaire technique du cours, explications structurées.",
-        "en": "Intermediate level: technical course vocabulary and structured explanations.",
-        "ar": "مستوى متوسط: مفردات تقنية وشروح منظمة.",
-    },
-    "advanced": {
-        "fr": "Niveau avancé : précision terminologique et explications approfondies, sans invention.",
-        "en": "Advanced level: terminological precision and deeper explanations, without invention.",
-        "ar": "مستوى متقدم: دقة اصطلاحية وشروح أعمق دون اختراع.",
-    },
-}
 _LANGUAGE_HINTS = {
     "fr": "Rédige entièrement en français.",
     "en": "Write entirely in English.",
@@ -87,6 +75,7 @@ class OriginalContentGenerator:
             raise TypeError("plan doit être un PedagogicalPlan.")
         if not plan.chapters:
             raise ValueError("Le plan pédagogique est incomplet.")
+        ensure_generation_capacity(self.guard, chapters=len(plan.chapters))
 
         pages = list(source_pages or [])
         source_text = _source_corpus(course, pages)
@@ -125,11 +114,9 @@ class OriginalContentGenerator:
         source_pages: list[CoursePage],
         source_text: str,
     ) -> ChapterDraft:
-        tokens = (
-            TOKENS_CHAPTER_SHORT
-            if plan.sheet_type == "short"
-            else TOKENS_CHAPTER_COMPLETE
-        )
+        # Refuse avant appel LLM si la densité dépasse le budget 640 tokens.
+        ensure_chapter_density(len(chapter_plan.concept_ids))
+        tokens = TOKENS_CHAPTER
         prompt = _build_chapter_prompt(
             course=course,
             plan=plan,
@@ -152,7 +139,6 @@ class OriginalContentGenerator:
             chapter_plan=chapter_plan,
             course=course,
             source_text=source_text,
-            sheet_type=plan.sheet_type,
         )
         return draft
 
@@ -166,9 +152,6 @@ def _build_chapter_prompt(
     source_pages: list[CoursePage],
 ) -> str:
     language = plan.language if plan.language in _LANGUAGE_HINTS else "fr"
-    level = plan.level if plan.level in _LEVEL_HINTS else "beginner"
-    sheet = plan.sheet_type
-    level_line = _LEVEL_HINTS[level].get(language, _LEVEL_HINTS[level]["fr"])
     language_line = _LANGUAGE_HINTS[language]
 
     concepts = [c for c in course.concepts if c.id in set(chapter_plan.concept_ids)]
@@ -195,16 +178,12 @@ def _build_chapter_prompt(
     ]
     page_excerpts = _page_excerpts(source_pages, chapter_plan.page_refs, concepts)
 
-    if sheet == "short":
-        style = (
-            "Fiche short : explications essentielles, synthétiques mais compréhensibles ; "
-            "exemples indispensables ; synthèse courte ; pas de questions de révision."
-        )
-    else:
-        style = (
-            "Fiche complete : développe concepts, relations et mécanismes ; "
-            "exemples pertinents ; tableau ou schéma si utile ; questions de révision."
-        )
+    style = (
+        "Fiche de révision complète et structurée : développe concepts, relations et "
+        "mécanismes ; définitions claires ; exemples pertinents ; tableau ou schéma si utile ; "
+        "termine par une synthèse pédagogique. "
+        "Interdit : questions de révision, quiz, type question."
+    )
 
     previous = ", ".join(previous_titles) if previous_titles else "(aucun)"
     plan_titles = " > ".join(ch.title for ch in plan.chapters)
@@ -212,7 +191,6 @@ def _build_chapter_prompt(
     return (
         "Tu es EduRAG. Rédige UN chapitre de cours pédagogique en JSON uniquement.\n"
         f"{language_line}\n"
-        f"{level_line}\n"
         f"{style}\n"
         "Règles strictes :\n"
         "- Reformule de façon originale : n'copie pas le PDF.\n"
@@ -221,16 +199,16 @@ def _build_chapter_prompt(
         "- Distingue origin=from_course et origin=pedagogical_addition pour les exemples.\n"
         "- Si une CONTRADICTION apparaît dans les notes, signale-la sans la résoudre.\n"
         "- Interdit : URL, bibliographie, contact, remerciements, listes de mots-clés vides.\n"
+        "- Interdit : toute question destinée à l'étudiant (type question, quiz, QCM).\n"
         "Schéma JSON (objet unique, JSON complet uniquement, sans Markdown et sans fence "
         "code) :\n"
         "Structure obligatoire : index (entier), title (texte), concept_ids_covered (liste "
         "d'identifiants), blocks (liste de blocs).\n"
         "Chaque bloc doit avoir un seul champ type exact parmi : paragraph, definition, "
-        "example, retain, table, diagram, synthesis, question.\n"
-        "Interdit : mettre plusieurs types dans une seule valeur type, ou utiliser le "
-        "caractère | pour combiner des types.\n"
+        "example, retain, table, diagram, synthesis.\n"
+        "Interdit : type question ; chaînes multi-types avec |.\n"
         "Champs obligatoires par type :\n"
-        "- paragraph, definition, diagram, retain, synthesis, question : type, text\n"
+        "- paragraph, definition, diagram, retain, synthesis : type, text\n"
         "- example : type, text, origin "
         "(origin exact : from_course ou pedagogical_addition)\n"
         "- table : type, headers, rows\n"
@@ -242,16 +220,16 @@ def _build_chapter_prompt(
         '{"type":"table","headers":["A","B"],"rows":[["1","2"]]}\n'
         '{"type":"diagram","text":"..."}\n'
         '{"type":"synthesis","text":"..."}\n'
-        '{"type":"question","text":"..."}\n'
         "Exemple d'objet chapitre : "
         '{"index":0,"title":"...","concept_ids_covered":["c1"],'
-        '"blocks":[{"type":"paragraph","text":"..."}]}\n'
+        '"blocks":[{"type":"paragraph","text":"..."},'
+        '{"type":"synthesis","text":"..."}]}\n'
         f"Plan global : {plan_titles}\n"
         f"Chapitres déjà rédigés : {previous}\n"
         f"Chapitre à rédiger : index={chapter_plan.index} ; titre={chapter_plan.title}\n"
         f"Objectifs : {json.dumps([o.model_dump() for o in chapter_plan.objectives], ensure_ascii=False)}\n"
         f"needs_example={chapter_plan.needs_example} ; needs_table={chapter_plan.needs_table} ; "
-        f"needs_questions={chapter_plan.needs_questions}\n"
+        "needs_questions=false\n"
         f"Concepts : {json.dumps(concepts_json, ensure_ascii=False)}\n"
         f"Relations : {json.dumps(relations, ensure_ascii=False)}\n"
         f"Extraits de pages :\n{page_excerpts}"
@@ -306,10 +284,11 @@ def _validate_chapter_draft(
     chapter_plan: ChapterPlan,
     course: CourseModel,
     source_text: str,
-    sheet_type: str,
 ) -> None:
     if not draft.blocks:
         raise ValueError("Le chapitre généré est vide ou incomplet.")
+
+    ensure_chapter_density(len(chapter_plan.concept_ids))
 
     required = set(chapter_plan.concept_ids)
     covered = set(draft.concept_ids_covered)
@@ -318,9 +297,16 @@ def _validate_chapter_draft(
             "Le chapitre ne couvre pas les concepts essentiels demandés par le plan."
         )
 
-    if sheet_type == "short":
-        if any(block.type == "question" for block in draft.blocks):
-            raise ValueError("Une fiche short ne doit pas contenir de questions de révision.")
+    unexplained = validate_chapter_concept_coverage(
+        draft, chapter_plan=chapter_plan, course=course
+    )
+    if unexplained:
+        raise ValueError(coverage_failure_message(unexplained))
+
+    if any(block.type == "question" for block in draft.blocks):
+        raise ValueError(
+            "Une fiche de révision ne doit pas contenir de questions de révision."
+        )
 
     concept_notes = " ".join(
         c.notes for c in course.concepts if c.id in required

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -9,6 +10,9 @@ from src.ingestion.pdf_loader import load_pdf
 from src.revision.engine.llm_guard import MAX_ANALYSIS_WINDOWS, MAX_COURSE_TOKENS_PER_WINDOW
 from src.revision.engine.models import CoursePage
 from src.revision.sheet import _find_document, _select_pages
+
+# Espaces horizontaux uniquement (préserve les retours à la ligne).
+_HORIZONTAL_SPACE = re.compile(r"[^\S\n]+")
 
 
 def _default_count_tokens(text: str) -> int:
@@ -20,8 +24,34 @@ def _default_count_tokens(text: str) -> int:
 
 
 def _clean_page_text(text: str) -> str:
-    """Supprime les pages vides et les espaces excessifs."""
-    return " ".join(text.split())
+    """Normalise les espaces horizontaux sans écraser la structure du texte."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [_HORIZONTAL_SPACE.sub(" ", line).strip() for line in normalized.split("\n")]
+    collapsed: list[str] = []
+    blank_pending = False
+    for line in lines:
+        if line == "":
+            if collapsed and not blank_pending:
+                collapsed.append("")
+            blank_pending = True
+            continue
+        collapsed.append(line)
+        blank_pending = False
+    while collapsed and collapsed[0] == "":
+        collapsed.pop(0)
+    while collapsed and collapsed[-1] == "":
+        collapsed.pop()
+    return "\n".join(collapsed)
+
+
+def _validate_page_token_count(value: object) -> int:
+    """Exige un entier strictement positif (booléens exclus)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(
+            "count_tokens doit retourner un entier strictement positif "
+            f"pour une page non vide (reçu {value!r})."
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -45,8 +75,13 @@ class CourseReader:
     ) -> None:
         if not callable(getattr(library, "list_documents", None)):
             raise TypeError("library doit fournir list_documents.")
+        if count_tokens is None:
+            self.count_tokens = _default_count_tokens
+        else:
+            if not callable(count_tokens):
+                raise TypeError("count_tokens doit être appelable.")
+            self.count_tokens = count_tokens
         self.library = library
-        self.count_tokens = count_tokens or _default_count_tokens
 
     def read(
         self,
@@ -92,7 +127,7 @@ class CourseReader:
         current_tokens = 0
 
         for page in pages:
-            page_tokens = self.count_tokens(page.text)
+            page_tokens = _validate_page_token_count(self.count_tokens(page.text))
             if page_tokens > MAX_COURSE_TOKENS_PER_WINDOW:
                 raise ValueError(
                     "Le cours sélectionné est trop volumineux. "
@@ -108,9 +143,11 @@ class CourseReader:
         if current:
             windows.append(current)
 
+        if not windows:
+            raise ValueError("Les pages du cours sont invalides.")
         if len(windows) > MAX_ANALYSIS_WINDOWS:
             raise ValueError(
-                "Le cours sélectionné est trop volumineux. "
-                "Sélectionnez moins de pages."
+                "Le cours sélectionné dépasse la capacité d'analyse "
+                f"({MAX_ANALYSIS_WINDOWS} fenêtres)."
             )
         return windows

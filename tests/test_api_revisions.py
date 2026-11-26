@@ -67,15 +67,17 @@ class _Assistant:
             self._validate(document_id, page_start, page_end, language, level, sheet_type)
             sheet_id = self._next
             self._next += 1
+            # Simule le moteur : pages complètes + valeurs legacy persistées.
+            del page_start, page_end, level, sheet_type
             row = {
                 "id": sheet_id,
                 "document_id": document_id,
                 "filename": self.documents[document_id],
-                "page_start": 1 if page_start is None else page_start,
-                "page_end": 3 if page_end is None else page_end,
+                "page_start": 1,
+                "page_end": 3,
                 "language": language,
-                "level": level,
-                "sheet_type": sheet_type,
+                "level": "intermediate",
+                "sheet_type": "complete",
                 "content": "La mitochondrie produit de l'énergie.",
                 "created_at": f"2026-11-25T13:00:0{sheet_id}.000000+00:00",
                 "stored_path": r"C:\secret\cours.pdf",
@@ -136,27 +138,13 @@ class _Assistant:
         level: object,
         sheet_type: object,
     ) -> None:
+        del page_start, page_end, level, sheet_type
         if not isinstance(document_id, str) or document_id.strip() == "":
             raise ValueError("L'identifiant du document est invalide.")
         if document_id not in self.documents:
             raise ValueError("Document introuvable dans la bibliothèque.")
-        if (page_start is None) != (page_end is None):
-            raise ValueError("L'intervalle de pages est invalide.")
-        if page_start is not None and (
-            isinstance(page_start, bool)
-            or isinstance(page_end, bool)
-            or not isinstance(page_start, int)
-            or not isinstance(page_end, int)
-            or page_start < 1
-            or page_end < page_start
-        ):
-            raise ValueError("L'intervalle de pages est invalide.")
         if language not in {"fr", "en", "ar"}:
             raise ValueError("La langue demandée n'est pas prise en charge.")
-        if level not in {"beginner", "intermediate", "advanced"}:
-            raise ValueError("Le niveau demandé n'est pas pris en charge.")
-        if sheet_type not in {"short", "complete"}:
-            raise ValueError("Le type de fiche demandé n'est pas pris en charge.")
 
     def _find(self, sheet_id: object) -> dict[str, str | int]:
         if isinstance(sheet_id, bool) or not isinstance(sheet_id, int) or sheet_id <= 0:
@@ -204,7 +192,13 @@ def test_create_revision_is_called_once() -> None:
 
     assert response.status_code == 201
     assert assistant.calls == [("doc-1", 2, 4, "ar", "advanced", "short")]
-    assert response.json() == _public_sheet(assistant.rows[0])
+    body = response.json()
+    assert body == _public_sheet(assistant.rows[0])
+    assert body["language"] == "ar"
+    assert body["level"] == "intermediate"
+    assert body["sheet_type"] == "complete"
+    assert body["page_start"] == 1
+    assert body["page_end"] == 3
     assert r"C:\secret" not in response.text
 
 
@@ -217,24 +211,39 @@ def test_create_revision_defaults_to_the_whole_document() -> None:
     assert assistant.calls == [("doc-1", None, None, "fr", "beginner", "complete")]
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "detail"),
-    [
-        ("language", "de", "La langue demandée n'est pas prise en charge."),
-        ("level", "expert", "Le niveau demandé n'est pas pris en charge."),
-        ("sheet_type", "long", "Le type de fiche demandé n'est pas pris en charge."),
-    ],
-)
-def test_create_revision_rejects_an_unsupported_choice(field: str, value: str, detail: str) -> None:
+def test_create_revision_rejects_an_unsupported_language() -> None:
     client, assistant = _client()
-    body = {"document_id": "doc-1", field: value}
 
-    response = client.post("/revisions", json=body)
+    response = client.post("/revisions", json={"document_id": "doc-1", "language": "de"})
 
     assert response.status_code == 400
-    assert response.json()["detail"] == detail
+    assert response.json()["detail"] == "La langue demandée n'est pas prise en charge."
     assert assistant.rows == []
     assert len(assistant.calls) == 1
+
+
+def test_create_revision_ignores_legacy_level_type_and_pages() -> None:
+    client, assistant = _client()
+
+    response = client.post(
+        "/revisions",
+        json={
+            "document_id": "doc-1",
+            "language": "fr",
+            "level": "expert",
+            "sheet_type": "long",
+            "page_start": 4,
+            "page_end": 2,
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["level"] == "intermediate"
+    assert body["sheet_type"] == "complete"
+    assert body["page_start"] == 1
+    assert body["page_end"] == 3
+    assert assistant.calls == [("doc-1", 4, 2, "fr", "expert", "long")]
 
 
 def test_create_revision_reports_a_missing_document() -> None:
@@ -247,34 +256,18 @@ def test_create_revision_reports_a_missing_document() -> None:
     assert assistant.rows == []
 
 
-@pytest.mark.parametrize(
-    "pages",
-    [
-        {"page_start": 4, "page_end": 2},
-        {"page_start": 2},
-    ],
-)
-def test_create_revision_rejects_an_invalid_page_range(pages: dict[str, int]) -> None:
-    client, assistant = _client()
-
-    response = client.post("/revisions", json={"document_id": "doc-1", **pages})
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "L'intervalle de pages est invalide."
-    assert assistant.rows == []
-
-
 def test_list_revisions_keeps_the_store_order_without_generation() -> None:
     client, assistant = _client()
-    client.post("/revisions", json={"document_id": "doc-1", "sheet_type": "short"})
-    client.post("/revisions", json={"document_id": "doc-1", "sheet_type": "complete"})
+    client.post("/revisions", json={"document_id": "doc-1", "language": "fr"})
+    client.post("/revisions", json={"document_id": "doc-1", "language": "en"})
     assistant.calls.clear()
 
     response = client.get("/revisions")
 
     assert response.status_code == 200
     assert [item["id"] for item in response.json()] == [2, 1]
-    assert [item["sheet_type"] for item in response.json()] == ["complete", "short"]
+    assert [item["language"] for item in response.json()] == ["en", "fr"]
+    assert [item["sheet_type"] for item in response.json()] == ["complete", "complete"]
     assert assistant.calls == []
     assert r"C:\secret" not in response.text
 

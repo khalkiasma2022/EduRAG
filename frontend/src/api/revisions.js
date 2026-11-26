@@ -2,13 +2,10 @@ import { apiRequest } from "./client.js";
 
 /**
  * Génère et enregistre une fiche de révision.
+ * Les nouveaux clients n'envoient que document_id et language.
  * @param {{
  *   document_id: string,
  *   language?: string,
- *   level?: string,
- *   sheet_type?: string,
- *   page_start?: number | null,
- *   page_end?: number | null,
  * }} payload
  * @returns {Promise<object>}
  */
@@ -18,10 +15,6 @@ export function createRevision(payload) {
     json: {
       document_id: payload.document_id,
       language: payload.language ?? "fr",
-      level: payload.level ?? "beginner",
-      sheet_type: payload.sheet_type ?? "complete",
-      page_start: payload.page_start ?? null,
-      page_end: payload.page_end ?? null,
     },
   });
 }

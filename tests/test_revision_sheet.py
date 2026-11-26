@@ -793,15 +793,11 @@ class _FakeEngine:
         self.error = error
         self.calls: list[dict] = []
 
-    def run(self, document_id: str, page_start=None, page_end=None, language="fr", level="beginner", sheet_type="complete"):
+    def run(self, document_id: str, language="fr", **_ignored):
         self.calls.append(
             {
                 "document_id": document_id,
-                "page_start": page_start,
-                "page_end": page_end,
                 "language": language,
-                "level": level,
-                "sheet_type": sheet_type,
             }
         )
         if self.error is not None:
@@ -810,7 +806,7 @@ class _FakeEngine:
         return dict(self.result)
 
 
-def test_generate_writes_a_short_sheet(tmp_path: Path) -> None:
+def test_generate_writes_a_revision_sheet(tmp_path: Path) -> None:
     llm = _GeneratingLLM(
         reply="unused",
         prompt_tokens=10,
@@ -824,11 +820,11 @@ def test_generate_writes_a_short_sheet(tmp_path: Path) -> None:
             "content": "Variables : une variable garde une valeur.",
             "document_id": added["document_id"],
             "filename": "cours_python.pdf",
-            "page_start": 2,
-            "page_end": 2,
+            "page_start": 1,
+            "page_end": 3,
             "language": "fr",
-            "level": "beginner",
-            "sheet_type": "short",
+            "level": "intermediate",
+            "sheet_type": "complete",
         },
     )
     sheet = RevisionSheet(
@@ -850,27 +846,23 @@ def test_generate_writes_a_short_sheet(tmp_path: Path) -> None:
         "content": "Variables : une variable garde une valeur.",
         "document_id": added["document_id"],
         "filename": "cours_python.pdf",
-        "page_start": 2,
-        "page_end": 2,
+        "page_start": 1,
+        "page_end": 3,
         "language": "fr",
-        "level": "beginner",
-        "sheet_type": "short",
+        "level": "intermediate",
+        "sheet_type": "complete",
     }
     assert engine.calls == [
         {
             "document_id": added["document_id"],
-            "page_start": 2,
-            "page_end": 2,
             "language": "fr",
-            "level": "beginner",
-            "sheet_type": "short",
         }
     ]
     assert engine.llm is llm
     assert llm.calls == 0
 
 
-def test_generate_writes_a_complete_sheet(tmp_path: Path) -> None:
+def test_generate_keeps_language_and_legacy_store_fields(tmp_path: Path) -> None:
     llm = _GeneratingLLM(
         reply="unused",
         prompt_tokens=10,
@@ -887,7 +879,7 @@ def test_generate_writes_a_complete_sheet(tmp_path: Path) -> None:
             "page_start": 1,
             "page_end": 3,
             "language": "en",
-            "level": "advanced",
+            "level": "intermediate",
             "sheet_type": "complete",
         },
     )
@@ -897,7 +889,7 @@ def test_generate_writes_a_complete_sheet(tmp_path: Path) -> None:
         engine_factory=lambda library, model: engine,
     )
 
-    result = sheet.generate(added["document_id"], language="en", level="advanced", sheet_type="complete")
+    result = sheet.generate(added["document_id"], language="en", level="advanced", sheet_type="short")
 
     assert result["content"] == "Python, variables et fonctions."
     assert result["document_id"] == added["document_id"]
@@ -905,11 +897,11 @@ def test_generate_writes_a_complete_sheet(tmp_path: Path) -> None:
     assert result["page_start"] == 1
     assert result["page_end"] == 3
     assert result["language"] == "en"
-    assert result["level"] == "advanced"
+    assert result["level"] == "intermediate"
     assert result["sheet_type"] == "complete"
-    assert engine.calls[0]["sheet_type"] == "complete"
     assert engine.calls[0]["language"] == "en"
-    assert engine.calls[0]["level"] == "advanced"
+    assert "level" not in engine.calls[0]
+    assert "sheet_type" not in engine.calls[0]
     assert llm.calls == 0
 
 

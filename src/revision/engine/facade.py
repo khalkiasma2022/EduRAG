@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from src.revision.engine.formatter import ContentFormatter
 from src.revision.engine.generator import OriginalContentGenerator
-from src.revision.engine.llm_guard import LlmBudgetGuard
+from src.revision.engine.llm_guard import (
+    LEGACY_STORE_LEVEL,
+    LEGACY_STORE_SHEET_TYPE,
+    LlmBudgetGuard,
+    ensure_generation_capacity,
+    ensure_pipeline_capacity,
+)
 from src.revision.engine.planner import PedagogicalPlanner
 from src.revision.engine.quality import QualityController
 from src.revision.engine.reader import CourseReader
@@ -71,15 +77,24 @@ class RevisionEngine:
         level: str = "beginner",
         sheet_type: str = "complete",
     ) -> dict[str, str | int]:
-        """Exécute le pipeline complet et renvoie un dict plat (sans sauvegarde)."""
-        read_result = self.reader.read(document_id, page_start, page_end)
+        """Exécute le pipeline complet et renvoie un dict plat (sans sauvegarde).
+
+        ``page_start``, ``page_end``, ``level`` et ``sheet_type`` sont ignorés pour
+        le contenu (compatibilité API). L'analyse porte toujours sur tout le PDF.
+        Les valeurs legacy sont figées pour SQLite.
+        """
+        del page_start, page_end, level, sheet_type
+        read_result = self.reader.read(document_id, None, None)
+        # Refus anticipé : le PDF doit tenir dans l'enveloppe understanding+plan+génération+QC.
+        ensure_pipeline_capacity(windows=len(read_result.windows))
         course = self.understanding.analyze(read_result.windows)
         plan = self.planner.plan(
             course,
-            sheet_type=sheet_type,
-            level=level,
+            sheet_type=LEGACY_STORE_SHEET_TYPE,
+            level=LEGACY_STORE_LEVEL,
             language=language,
         )
+        ensure_generation_capacity(self.guard, chapters=len(plan.chapters))
         document = self.generator.generate(
             course,
             plan,
@@ -105,8 +120,8 @@ class RevisionEngine:
             "page_start": int(read_result.page_start),
             "page_end": int(read_result.page_end),
             "language": language,
-            "level": level,
-            "sheet_type": sheet_type,
+            "level": LEGACY_STORE_LEVEL,
+            "sheet_type": LEGACY_STORE_SHEET_TYPE,
         }
 
     def _assert_shared_guard(self) -> None:

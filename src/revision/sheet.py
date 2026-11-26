@@ -333,11 +333,11 @@ class RevisionSheet:
     ) -> dict[str, str | int]:
         """Produit une fiche via RevisionEngine (sans sauvegarde).
 
-        Les paramètres restent ceux de l'API : document, pages, langue, niveau, type.
+        ``page_start``, ``page_end``, ``level`` et ``sheet_type`` sont acceptés pour
+        compatibilité API mais ignorés pour le contenu. Seule ``language`` guide la rédaction.
         """
         _check_choice(language, _LANGUAGES, "La langue demandée n'est pas prise en charge.")
-        _check_choice(level, _LEVELS, "Le niveau demandé n'est pas pris en charge.")
-        _check_choice(sheet_type, _SHEET_TYPES, "Le type de fiche demandé n'est pas pris en charge.")
+        del level, sheet_type, page_start, page_end
 
         if self._engine_factory is not None:
             engine = self._engine_factory(self.library, self.llm)
@@ -352,14 +352,7 @@ class RevisionSheet:
                 "RevisionEngine doit réutiliser la même instance Qwen que RevisionSheet."
             )
 
-        result = engine.run(
-            document_id,
-            page_start=page_start,
-            page_end=page_end,
-            language=language,
-            level=level,
-            sheet_type=sheet_type,
-        )
+        result = engine.run(document_id, language=language)
         content = _check_generated_sheet(result.get("content"))
         return {
             "content": content,
@@ -368,8 +361,8 @@ class RevisionSheet:
             "page_start": int(result["page_start"]),
             "page_end": int(result["page_end"]),
             "language": language,
-            "level": level,
-            "sheet_type": sheet_type,
+            "level": str(result["level"]),
+            "sheet_type": str(result["sheet_type"]),
         }
 
 

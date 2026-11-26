@@ -11,7 +11,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from src.ingestion.library import DocumentLibrary
 from src.revision.engine.llm_guard import MAX_ANALYSIS_WINDOWS, MAX_COURSE_TOKENS_PER_WINDOW
 from src.revision.engine.models import CoursePage
-from src.revision.engine.reader import CourseReader
+from src.revision.engine.reader import CourseReader, _clean_page_text
 
 
 class FakeEmbeddingModel:
@@ -132,13 +132,13 @@ def test_windows_respect_token_budget(tmp_path: Path) -> None:
 def test_too_many_windows_raises_explicit_error(tmp_path: Path) -> None:
     pages = [f"Page{i}" for i in range(1, MAX_ANALYSIS_WINDOWS + 2)]
     library, added = _library_with_pdf(tmp_path, pages)
-    # Une page = une fenêtre pleine → besoin de 6 fenêtres > plafond 5.
+    # Une page = une fenêtre pleine → besoin de MAX+1 fenêtres > plafond.
     reader = CourseReader(
         library,
         count_tokens=lambda text: MAX_COURSE_TOKENS_PER_WINDOW,
     )
 
-    with pytest.raises(ValueError, match="moins de pages"):
+    with pytest.raises(ValueError, match="capacité d'analyse|fenêtres"):
         reader.read(added["document_id"])
 
 
@@ -151,3 +151,55 @@ def test_single_page_over_window_budget_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="moins de pages"):
         reader.read(added["document_id"])
+
+
+def test_clean_page_text_preserves_paragraphs_and_newlines() -> None:
+    raw = (
+        "Titre du cours\n"
+        "  Ligne   avec   espaces\tredondants  \n"
+        "\n"
+        "\n"
+        "Paragraphe suivant.\n"
+        "Encore une ligne.\n"
+        "\n"
+    )
+    cleaned = _clean_page_text(raw)
+    assert "\n" in cleaned
+    assert "Titre du cours\nLigne avec espaces redondants\n\nParagraphe suivant.\nEncore une ligne." == cleaned
+    assert "Titre du cours" in cleaned
+    assert "Paragraphe suivant." in cleaned
+    assert "  " not in cleaned.replace("\n\n", "")
+
+
+def test_clean_page_text_does_not_drop_content() -> None:
+    raw = "Alpha\nBeta\nGamma"
+    cleaned = _clean_page_text(raw)
+    assert "Alpha" in cleaned and "Beta" in cleaned and "Gamma" in cleaned
+    assert cleaned.count("\n") == 2
+
+
+def test_count_tokens_must_be_callable(tmp_path: Path) -> None:
+    library, _added = _library_with_pdf(tmp_path, ["Page un"])
+    with pytest.raises(TypeError, match="count_tokens|appelable"):
+        CourseReader(library, count_tokens="not-callable")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [0, -3, True, False, "12", 3.5, None],
+)
+def test_count_tokens_rejects_non_positive_int_results(
+    tmp_path: Path, bad_value: object
+) -> None:
+    library, added = _library_with_pdf(tmp_path, ["Page un"])
+    reader = CourseReader(library, count_tokens=lambda _text: bad_value)  # type: ignore[arg-type, return-value]
+    with pytest.raises(ValueError, match="entier strictement positif|count_tokens"):
+        reader.read(added["document_id"])
+
+
+def test_count_tokens_accepts_strict_positive_int(tmp_path: Path) -> None:
+    library, added = _library_with_pdf(tmp_path, ["AAAA", "BBBB"])
+    reader = CourseReader(library, count_tokens=lambda _text: 1)
+    result = reader.read(added["document_id"])
+    assert len(result.pages) == 2
+    assert len(result.windows) == 1

@@ -95,11 +95,20 @@ def revision_pipeline_reply(prompt: str) -> str | None:
         page_match = re.search(r"c_page_(\d+)", concept_id)
         page = int(page_match.group(1)) if page_match else 1
         needs_questions = "needs_questions=True" in prompt
+        label_match = re.search(
+            r'"id":\s*"' + re.escape(concept_id) + r'"[^}]*?"label":\s*"([^"]+)"',
+            prompt,
+            flags=re.DOTALL,
+        )
+        label = label_match.group(1) if label_match else f"notion page {page}"
         # Aucun chiffre dans les textes : le QC refuse les nombres absents du PDF source.
         blocks = [
             {
                 "type": "paragraph",
-                "text": "Explication originale du chapitre pour la notion étudiée.",
+                "text": (
+                    f"Explication originale du chapitre pour {label}, "
+                    "notion étudiée dans le cours."
+                ),
                 "source_pages": [page],
             },
             {
@@ -115,7 +124,7 @@ def revision_pipeline_reply(prompt: str) -> str | None:
             },
             {
                 "type": "synthesis",
-                "text": "Retenir l'essentiel du chapitre.",
+                "text": f"Retenir l'essentiel concernant {label}.",
                 "source_pages": [page],
             },
         ]

@@ -9,6 +9,8 @@ import pytest
 from src.revision.engine.llm_guard import (
     LlmBudgetGuard,
     MAX_ANALYSIS_WINDOWS,
+    MAX_LLM_CALLS,
+    MAX_TOTAL_NEW_TOKENS,
     TOKENS_UNDERSTANDING,
 )
 from src.revision.engine.models import CoursePage
@@ -277,40 +279,84 @@ def test_invalid_json_after_retries_raises_clean_error() -> None:
     assert guard.reserved_tokens == 2 * TOKENS_UNDERSTANDING
 
 
-def test_respects_call_and_token_ceilings() -> None:
-    # Prépare assez de fenêtres pour consommer le budget, puis une de trop.
-    replies = [
-        _window_payload(
-            themes=[f"T{i}"],
-            concepts=[
-                {
-                    "id": f"c{i}",
-                    "label": f"n{i}",
-                    "kind": "other",
-                    "pages": [i + 1],
-                    "essential": False,
-                    "depends_on": [],
-                    "notes": "",
-                }
-            ],
-        )
-        for i in range(MAX_ANALYSIS_WINDOWS)
-    ]
-    llm = ScriptedLLM(replies)
+def test_respects_call_ceiling() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["T0"],
+                concepts=[
+                    {
+                        "id": "c0",
+                        "label": "n0",
+                        "kind": "other",
+                        "pages": [1],
+                        "essential": False,
+                        "depends_on": [],
+                        "notes": "",
+                    }
+                ],
+            )
+        ]
+    )
     guard = LlmBudgetGuard()
-    # Saturation artificielle du plafond d'appels avant analyse.
-    for _ in range(16):
+    for _ in range(MAX_LLM_CALLS):
         guard.reserve(1)
 
     understanding = CourseUnderstanding(llm, guard)
     with pytest.raises(ValueError, match="appels"):
         understanding.analyze([[_page(1, "x")]])
+    assert llm.calls == 0
+    assert guard.calls == MAX_LLM_CALLS
+    assert guard.reserved_tokens == MAX_LLM_CALLS
+
+
+def test_respects_token_ceiling() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Tokens"],
+                concepts=[
+                    {
+                        "id": "c_tok",
+                        "label": "notion",
+                        "kind": "other",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "note",
+                    }
+                ],
+            )
+        ]
+    )
+    guard = LlmBudgetGuard()
+    # 1 fenêtre ⇒ besoin garanti = 2 * TOKENS_UNDERSTANDING ; laisser 1 de moins.
+    tokens_to_leave = 2 * TOKENS_UNDERSTANDING - 1
+    calls_to_leave = 10  # largement au-dessus du besoin d'appels (2)
+    tokens_to_burn = MAX_TOTAL_NEW_TOKENS - tokens_to_leave
+    calls_to_burn = MAX_LLM_CALLS - calls_to_leave
+    base = tokens_to_burn // calls_to_burn
+    rem = tokens_to_burn % calls_to_burn
+    for index in range(calls_to_burn):
+        guard.reserve(base + (1 if index < rem else 0))
+
+    assert guard.remaining_tokens == tokens_to_leave
+    assert guard.remaining_calls == calls_to_leave
+    calls_before = guard.calls
+    tokens_before = guard.reserved_tokens
+
+    with pytest.raises(ValueError, match="tokens|plafond de tokens"):
+        CourseUnderstanding(llm, guard).analyze([[_page(1, "texte")]])
+
+    assert llm.calls == 0
+    assert guard.calls == calls_before
+    assert guard.reserved_tokens == tokens_before
 
 
 def test_too_many_windows_refused_without_truncation() -> None:
     llm = ScriptedLLM([])
     windows = [[_page(i, f"p{i}")] for i in range(1, MAX_ANALYSIS_WINDOWS + 2)]
-    with pytest.raises(ValueError, match="moins de pages"):
+    with pytest.raises(ValueError, match="capacité d'analyse|fenêtres"):
         CourseUnderstanding(llm, LlmBudgetGuard()).analyze(windows)
     assert llm.calls == 0
 
@@ -451,3 +497,513 @@ def test_invalid_kind_error_lists_allowed_values() -> None:
     assert "banana" in message
     for allowed in _KIND_VALUES:
         assert allowed in message
+
+
+def _assert_no_orphan_ids(model) -> None:
+    known = {c.id for c in model.concepts}
+    for concept in model.concepts:
+        for dep in concept.depends_on:
+            assert dep in known
+            assert dep != concept.id
+    for relation in model.relations:
+        assert relation.source_id in known
+        assert relation.target_id in known
+
+
+def test_same_as_towards_already_known_concept_merges_pages_and_aliases() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Cloud"],
+                concepts=[
+                    {
+                        "id": "c_iaas",
+                        "label": "IaaS",
+                        "kind": "other",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Infrastructure as a Service.",
+                    }
+                ],
+            ),
+            _window_payload(
+                themes=["Cloud"],
+                concepts=[
+                    {
+                        "id": "c_iaas_local",
+                        "label": "IaaS",
+                        "kind": "other",
+                        "pages": [2],
+                        "essential": False,
+                        "depends_on": [],
+                        "notes": "Infrastructure as a Service.",
+                        "same_as": "c_iaas",
+                    }
+                ],
+            ),
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze(
+        [[_page(1, "IaaS p1")], [_page(2, "IaaS p2")]]
+    )
+    assert {c.id for c in model.concepts} == {"c_iaas"}
+    concept = model.concepts[0]
+    assert concept.pages == [1, 2]
+    assert concept.essential is True
+    assert "c_iaas_local" not in {c.id for c in model.concepts}
+    _assert_no_orphan_ids(model)
+
+
+def test_same_as_towards_future_window_concept() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Cloud"],
+                concepts=[
+                    {
+                        "id": "c_local_vm",
+                        "label": "machine virtuelle",
+                        "kind": "mechanism",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Ordinateur logiciel isole.",
+                        "same_as": "c_vm",
+                    }
+                ],
+            ),
+            _window_payload(
+                themes=["Cloud"],
+                concepts=[
+                    {
+                        "id": "c_vm",
+                        "label": "VM",
+                        "kind": "mechanism",
+                        "pages": [2],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Virtual machine.",
+                    }
+                ],
+            ),
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze(
+        [[_page(1, "VM locale")], [_page(2, "VM canonique")]]
+    )
+    assert {c.id for c in model.concepts} == {"c_vm"}
+    concept = model.concepts[0]
+    assert concept.pages == [1, 2]
+    assert "CONTRADICTION" in concept.notes.upper() or "Virtual machine" in concept.notes
+    _assert_no_orphan_ids(model)
+
+
+def test_successive_aliases_collapse_to_one_canonical() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Reseau"],
+                concepts=[
+                    {
+                        "id": "c_vpc",
+                        "label": "VPC",
+                        "kind": "other",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Virtual Private Cloud.",
+                    }
+                ],
+            ),
+            _window_payload(
+                themes=["Reseau"],
+                concepts=[
+                    {
+                        "id": "c_vpc_alias",
+                        "label": "cloud prive virtuel",
+                        "kind": "other",
+                        "pages": [2],
+                        "essential": False,
+                        "depends_on": [],
+                        "notes": "Reseau logique isole.",
+                        "same_as": "c_vpc",
+                    }
+                ],
+            ),
+            _window_payload(
+                themes=["Reseau"],
+                concepts=[
+                    {
+                        "id": "c_vpc_alias2",
+                        "label": "VPC",
+                        "kind": "other",
+                        "pages": [3],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Encore le VPC.",
+                        "same_as": "c_vpc_alias",
+                    }
+                ],
+            ),
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze(
+        [[_page(1, "vpc1")], [_page(2, "vpc2")], [_page(3, "vpc3")]]
+    )
+    assert {c.id for c in model.concepts} == {"c_vpc"}
+    assert model.concepts[0].pages == [1, 2, 3]
+    assert model.concepts[0].essential is True
+    _assert_no_orphan_ids(model)
+
+
+def test_depends_on_remapped_after_same_as_fusion() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Stockage"],
+                concepts=[
+                    {
+                        "id": "c_object",
+                        "label": "stockage objet",
+                        "kind": "definition",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Blobs identifies par cle.",
+                    }
+                ],
+            ),
+            _window_payload(
+                themes=["Stockage"],
+                concepts=[
+                    {
+                        "id": "c_object_alias",
+                        "label": "object storage",
+                        "kind": "definition",
+                        "pages": [2],
+                        "essential": False,
+                        "depends_on": [],
+                        "notes": "Blobs identifies par cle.",
+                        "same_as": "c_object",
+                    },
+                    {
+                        "id": "c_bucket",
+                        "label": "bucket",
+                        "kind": "other",
+                        "pages": [2],
+                        "essential": True,
+                        "depends_on": ["c_object_alias"],
+                        "notes": "Conteneur logique de stockage objet.",
+                    },
+                ],
+            ),
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze(
+        [[_page(1, "objet")], [_page(2, "bucket")]]
+    )
+    by_id = {c.id: c for c in model.concepts}
+    assert set(by_id) == {"c_object", "c_bucket"}
+    assert by_id["c_bucket"].depends_on == ["c_object"]
+    _assert_no_orphan_ids(model)
+
+
+def test_cross_window_relations_use_canonical_ids() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Securite"],
+                concepts=[
+                    {
+                        "id": "c_iam",
+                        "label": "IAM",
+                        "kind": "method",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Identity and Access Management.",
+                    }
+                ],
+            ),
+            _window_payload(
+                themes=["Securite"],
+                concepts=[
+                    {
+                        "id": "c_iam_alias",
+                        "label": "gestion des identites",
+                        "kind": "method",
+                        "pages": [2],
+                        "essential": False,
+                        "depends_on": [],
+                        "notes": "Identity and Access Management.",
+                        "same_as": "c_iam",
+                    },
+                    {
+                        "id": "c_policy",
+                        "label": "politique IAM",
+                        "kind": "other",
+                        "pages": [2],
+                        "essential": True,
+                        "depends_on": ["c_iam_alias"],
+                        "notes": "Regles de moindre privilege.",
+                    },
+                ],
+                relations=[
+                    {
+                        "source_id": "c_policy",
+                        "target_id": "c_iam_alias",
+                        "relation_type": "depends_on",
+                        "pages": [2],
+                    }
+                ],
+            ),
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze(
+        [[_page(1, "IAM")], [_page(2, "politique")]]
+    )
+    assert len(model.relations) == 1
+    assert model.relations[0].source_id == "c_policy"
+    assert model.relations[0].target_id == "c_iam"
+    _assert_no_orphan_ids(model)
+
+
+def test_orphan_relations_and_depends_are_dropped() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Reseau"],
+                concepts=[
+                    {
+                        "id": "c_lb",
+                        "label": "equilibreur",
+                        "kind": "mechanism",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": ["c_missing_dep"],
+                        "notes": "Repartit le trafic.",
+                    }
+                ],
+                relations=[
+                    {
+                        "source_id": "c_lb",
+                        "target_id": "c_ghost",
+                        "relation_type": "related",
+                        "pages": [1],
+                    },
+                    {
+                        "source_id": "c_ghost",
+                        "target_id": "c_lb",
+                        "relation_type": "related",
+                        "pages": [1],
+                    },
+                ],
+            )
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze([[_page(1, "LB")]])
+    assert {c.id for c in model.concepts} == {"c_lb"}
+    assert model.concepts[0].depends_on == []
+    assert model.relations == []
+    _assert_no_orphan_ids(model)
+
+
+def test_duplicate_relations_are_merged_with_page_union() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Cloud"],
+                concepts=[
+                    {
+                        "id": "c_a",
+                        "label": "A",
+                        "kind": "other",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "A",
+                    },
+                    {
+                        "id": "c_b",
+                        "label": "B",
+                        "kind": "other",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": ["c_a"],
+                        "notes": "B",
+                    },
+                ],
+                relations=[
+                    {
+                        "source_id": "c_b",
+                        "target_id": "c_a",
+                        "relation_type": "depends_on",
+                        "pages": [1],
+                    },
+                    {
+                        "source_id": "c_b",
+                        "target_id": "c_a",
+                        "relation_type": "depends_on",
+                        "pages": [2],
+                    },
+                ],
+            )
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze([[_page(1, "A B")]])
+    assert len(model.relations) == 1
+    assert model.relations[0].pages == [1, 2]
+    _assert_no_orphan_ids(model)
+
+
+def test_final_ids_are_internally_consistent_after_complex_merge() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Virtualisation"],
+                concepts=[
+                    {
+                        "id": "c_hyp",
+                        "label": "hyperviseur",
+                        "kind": "mechanism",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Abstrait le materiel.",
+                    }
+                ],
+            ),
+            _window_payload(
+                themes=["Virtualisation"],
+                concepts=[
+                    {
+                        "id": "c_hyp2",
+                        "label": "hyperviseur",
+                        "kind": "mechanism",
+                        "pages": [2],
+                        "essential": False,
+                        "depends_on": [],
+                        "notes": "Abstrait le materiel.",
+                        "same_as": "c_hyp",
+                    },
+                    {
+                        "id": "c_vm",
+                        "label": "VM",
+                        "kind": "mechanism",
+                        "pages": [2],
+                        "essential": True,
+                        "depends_on": ["c_hyp2"],
+                        "notes": "Machine virtuelle.",
+                    },
+                ],
+                relations=[
+                    {
+                        "source_id": "c_vm",
+                        "target_id": "c_hyp2",
+                        "relation_type": "depends_on",
+                        "pages": [2],
+                    }
+                ],
+            ),
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze(
+        [[_page(1, "hyp")], [_page(2, "vm")]]
+    )
+    known = {c.id for c in model.concepts}
+    assert known == {"c_hyp", "c_vm"}
+    assert next(c for c in model.concepts if c.id == "c_vm").depends_on == ["c_hyp"]
+    assert model.relations[0].target_id == "c_hyp"
+    assert "c_hyp" in model.essential_concept_ids
+    _assert_no_orphan_ids(model)
+
+
+def test_contradiction_on_future_alias_applies_to_canonical() -> None:
+    """Contradiction vers un alias découvert plus tard → notes du concept canonique."""
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Cloud"],
+                concepts=[
+                    {
+                        "id": "c_main",
+                        "label": "IaaS",
+                        "kind": "other",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Infrastructure as a Service.",
+                    }
+                ],
+                contradictions=[
+                    {
+                        "concept_id": "c_alias",
+                        "description": "Deux formulations concurrentes pour IaaS.",
+                        "pages": [1, 3],
+                    }
+                ],
+            ),
+            _window_payload(
+                themes=["Cloud"],
+                concepts=[
+                    {
+                        "id": "c_alias",
+                        "label": "infrastructure as a service",
+                        "kind": "other",
+                        "pages": [2],
+                        "essential": False,
+                        "depends_on": [],
+                        "notes": "Infrastructure as a Service.",
+                        "same_as": "c_main",
+                    }
+                ],
+            ),
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze(
+        [[_page(1, "IaaS p1")], [_page(2, "IaaS p2")]]
+    )
+    assert {c.id for c in model.concepts} == {"c_main"}
+    concept = model.concepts[0]
+    assert "CONTRADICTION" in concept.notes.upper()
+    assert "Deux formulations concurrentes pour IaaS." in concept.notes
+    assert 1 in concept.pages
+    assert 3 in concept.pages
+    assert 2 in concept.pages
+    _assert_no_orphan_ids(model)
+
+
+def test_contradiction_on_unknown_id_is_silently_ignored() -> None:
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Reseau"],
+                concepts=[
+                    {
+                        "id": "c_vpc",
+                        "label": "VPC",
+                        "kind": "other",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Virtual Private Cloud.",
+                    }
+                ],
+                contradictions=[
+                    {
+                        "concept_id": "c_ghost_unknown",
+                        "description": "Contradiction orpheline sans concept cible.",
+                        "pages": [9],
+                    }
+                ],
+            )
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze([[_page(1, "VPC")]])
+    assert {c.id for c in model.concepts} == {"c_vpc"}
+    concept = model.concepts[0]
+    assert "CONTRADICTION" not in concept.notes.upper()
+    assert "orpheline" not in concept.notes.casefold()
+    assert concept.pages == [1]
+    _assert_no_orphan_ids(model)

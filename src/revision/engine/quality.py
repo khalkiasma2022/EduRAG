@@ -8,11 +8,17 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from src.revision.engine.coverage import (
+    coverage_failure_message,
+    rewrite_impoverishment_reason,
+    validate_chapter_concept_coverage,
+)
 from src.revision.engine.llm_guard import (
     MAX_REWRITE_CHAPTERS,
     TOKENS_REWRITE,
     LlmBudgetGuard,
     ensure_prompt_fits,
+    max_attempts_per_step,
 )
 from src.revision.engine.models import (
     ChapterDraft,
@@ -66,6 +72,7 @@ _REWRITABLE_CODES = frozenset(
         "invented_resolution",
         "generic_filler",
         "missing_explanation",
+        "unexplained_concept",
         "forbidden_section",
         "invented_number",
         "unmarked_example",
@@ -102,6 +109,7 @@ class QualityController:
         working = document.model_copy(deep=True)
         rewritten: list[int] = []
 
+        working = _strip_question_blocks(working)
         report = self._evaluate(working, course, plan, source_text)
         if report.ok:
             return working, report
@@ -110,6 +118,13 @@ class QualityController:
             raise ValueError(
                 "Contrôle qualité en échec : le document ne respecte pas le plan "
                 f"({_summarize_issues(report.issues)})."
+            )
+
+        # Les erreurs non réécriture (ex. ids manquants) bloquent avant toute réécriture.
+        if _has_non_rewritable_error(report.issues):
+            raise ValueError(
+                "Contrôle qualité en échec : "
+                f"{_summarize_issues(report.issues)}."
             )
 
         targets = _select_rewrite_targets(report.issues)
@@ -122,9 +137,22 @@ class QualityController:
         for chapter_index in targets:
             if len(rewritten) >= MAX_REWRITE_CHAPTERS:
                 break
+            # Garantir tentative + retry (run_with_retries) avant de démarrer.
+            attempts = max_attempts_per_step()
+            need_calls = attempts
+            need_tokens = attempts * TOKENS_REWRITE
+            if (
+                self.guard.remaining_calls < need_calls
+                or self.guard.remaining_tokens < need_tokens
+            ):
+                break
             chapter_plan = _chapter_plan_by_index(plan, chapter_index)
             if chapter_plan is None:
                 continue
+            original = next(
+                (ch for ch in working.chapters if ch.index == chapter_index),
+                None,
+            )
             try:
                 new_draft = self._rewrite_chapter(
                     working,
@@ -133,6 +161,7 @@ class QualityController:
                     chapter_plan=chapter_plan,
                     source_pages=pages,
                     issues=[i for i in report.issues if i.chapter_index == chapter_index],
+                    original=original,
                 )
             except ValueError as error:
                 raise ValueError(
@@ -152,6 +181,7 @@ class QualityController:
                 "Contrôle qualité en échec après réécriture : "
                 f"{_summarize_issues(final.issues)}."
             )
+        working = _strip_question_blocks(working)
         return working, final
 
     def _evaluate(
@@ -243,6 +273,7 @@ class QualityController:
         chapter_plan: ChapterPlan,
         source_pages: list[CoursePage],
         issues: list[QualityIssue],
+        original: ChapterDraft | None = None,
     ) -> ChapterDraft:
         prompt = _build_rewrite_prompt(
             document=document,
@@ -251,17 +282,52 @@ class QualityController:
             chapter_plan=chapter_plan,
             source_pages=source_pages,
             issues=issues,
+            original=original,
         )
 
         def produce() -> str:
             ensure_prompt_fits(self.llm, prompt, TOKENS_REWRITE)
             return self.llm.generate(prompt, max_new_tokens=TOKENS_REWRITE)
 
+        def parse(raw: str) -> ChapterDraft:
+            draft = _parse_chapter_draft(raw, expected_index=chapter_plan.index)
+            unexplained = validate_chapter_concept_coverage(
+                draft, chapter_plan=chapter_plan, course=course
+            )
+            if unexplained:
+                raise ValueError(coverage_failure_message(unexplained))
+            if original is not None:
+                reason = rewrite_impoverishment_reason(
+                    original,
+                    draft,
+                    chapter_plan=chapter_plan,
+                    course=course,
+                )
+                if reason:
+                    raise ValueError(reason)
+            return draft
+
         return self.guard.run_with_retries(
             produce,
             tokens=TOKENS_REWRITE,
-            parse=lambda raw: _parse_chapter_draft(raw, expected_index=chapter_plan.index),
+            parse=parse,
         )
+
+
+def _strip_question_blocks(document: PedagogicalDocument) -> PedagogicalDocument:
+    """Retire les blocs question sans toucher au reste du contenu."""
+    chapters: list[ChapterDraft] = []
+    changed = False
+    for chapter in document.chapters:
+        kept = [block for block in chapter.blocks if getattr(block, "type", None) != "question"]
+        if len(kept) != len(chapter.blocks):
+            changed = True
+            chapters.append(chapter.model_copy(update={"blocks": kept}))
+        else:
+            chapters.append(chapter)
+    if not changed:
+        return document
+    return document.model_copy(update={"chapters": chapters})
 
 
 def _evaluate_chapter(
@@ -297,6 +363,18 @@ def _evaluate_chapter(
                         "Le chapitre ne couvre pas les concepts prévus : "
                         + ", ".join(sorted(required - covered))
                     ),
+                    chapter_index=index,
+                )
+            )
+        unexplained = validate_chapter_concept_coverage(
+            draft, chapter_plan=chapter_plan, course=course
+        )
+        if unexplained:
+            issues.append(
+                QualityIssue(
+                    code="unexplained_concept",
+                    severity="error",
+                    message=coverage_failure_message(unexplained),
                     chapter_index=index,
                 )
             )
@@ -520,6 +598,13 @@ def _has_structural_failure(issues: list[QualityIssue]) -> bool:
     return any(issue.code == "missing_chapter" for issue in issues)
 
 
+def _has_non_rewritable_error(issues: list[QualityIssue]) -> bool:
+    return any(
+        issue.severity == "error" and issue.code not in _REWRITABLE_CODES
+        for issue in issues
+    )
+
+
 def _select_rewrite_targets(issues: list[QualityIssue]) -> list[int]:
     indexes: list[int] = []
     for issue in issues:
@@ -566,6 +651,7 @@ def _build_rewrite_prompt(
     chapter_plan: ChapterPlan,
     source_pages: list[CoursePage],
     issues: list[QualityIssue],
+    original: ChapterDraft | None = None,
 ) -> str:
     issue_lines = "; ".join(f"{i.code}: {i.message}" for i in issues) or "défauts de qualité"
     concepts = [c for c in course.concepts if c.id in set(chapter_plan.concept_ids)]
@@ -577,19 +663,31 @@ def _build_rewrite_prompt(
         if page.page_number in wanted:
             excerpts.append(f"[Page {page.page_number}]\n{page.text}")
     previous = [ch.title for ch in document.chapters if ch.index != chapter_plan.index]
+    original_json = (
+        json.dumps(original.model_dump(), ensure_ascii=False)
+        if original is not None
+        else "(indisponible)"
+    )
     return (
         "Tu es EduRAG. Réécris UNIQUEMENT le chapitre indiqué en JSON valide.\n"
         "Corrige les défauts listés. Ne copie pas le PDF. N'invente rien.\n"
+        "Conserve tous les concepts prévus (essentiels et secondaires), les exemples, "
+        "formules, tableaux et références de pages déjà présents.\n"
+        "N'appauvris pas les explications : la couverture réelle doit rester au moins "
+        "équivalente au chapitre d'origine.\n"
         "Si une CONTRADICTION est présente, signale-la sans la résoudre.\n"
         "Distingue origin=from_course et origin=pedagogical_addition.\n"
+        "Interdit : type question, quiz, questions de révision.\n"
+        "Chaque bloc a un seul type parmi : paragraph, definition, example, retain, "
+        "table, diagram, synthesis.\n"
         "Schéma : "
         '{"index":0,"title":"...","concept_ids_covered":["..."],'
-        '"blocks":[{"type":"paragraph|definition|example|retain|table|diagram|synthesis|question",'
-        '"text":"...","origin":"from_course|pedagogical_addition","source_pages":[1]}]}\n'
-        f"Langue={plan.language} ; niveau={plan.level} ; type={plan.sheet_type}\n"
+        '"blocks":[{"type":"paragraph","text":"..."}]}\n'
+        f"Langue={plan.language}\n"
         f"Défauts à corriger : {issue_lines}\n"
         f"Chapitre : index={chapter_plan.index} ; titre={chapter_plan.title}\n"
         f"Concepts : {json.dumps([c.model_dump() for c in concepts], ensure_ascii=False)}\n"
+        f"Chapitre d'origine : {original_json}\n"
         f"Autres chapitres déjà valides : {', '.join(previous) or '(aucun)'}\n"
         f"Extraits :\n{chr(10).join(excerpts) if excerpts else '(aucun)'}"
     )

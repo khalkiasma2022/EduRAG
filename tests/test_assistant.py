@@ -455,11 +455,12 @@ def test_create_revision_saves_one_sheet_without_searching(
     assert "Explication originale" in saved["content"]
     assert saved["document_id"] == added["document_id"]
     assert saved["filename"] == "cours.pdf"
-    assert saved["page_start"] == 2
+    # Intervalle / niveau / type demandés sont ignorés : analyse complète + valeurs legacy.
+    assert saved["page_start"] == 1
     assert saved["page_end"] == 3
     assert saved["language"] == "en"
-    assert saved["level"] == "advanced"
-    assert saved["sheet_type"] == "short"
+    assert saved["level"] == "intermediate"
+    assert saved["sheet_type"] == "complete"
     assert assistant.revision_store.get(saved["id"]) == saved
     assert ask_calls == []
     assert assistant.embedding_model.query_calls == queries_before
@@ -546,10 +547,13 @@ def test_list_and_get_revision_return_saved_sheets(
     assert found["document_id"] == added["document_id"]
     assert found["filename"] == "cours.pdf"
     assert found["page_start"] == 1
-    assert found["page_end"] == 1
+    assert found["page_end"] == 3
     assert found["language"] == "fr"
-    assert found["level"] == "beginner"
-    assert found["sheet_type"] == "short"
+    assert found["level"] == "intermediate"
+    assert found["sheet_type"] == "complete"
+    assert second["language"] == "en"
+    assert second["level"] == "intermediate"
+    assert second["sheet_type"] == "complete"
     assert "Fiche de révision" in found["content"]
     assert found["created_at"]
     assert len(assistant.llm.prompts) == before["prompts"]
@@ -651,7 +655,7 @@ def test_export_revision_writes_markdown_and_pdf_from_sqlite(
     assert saved["filename"] in markdown
     assert saved["created_at"] in markdown
     assert "Français" in markdown
-    assert "Débutant" in markdown
+    assert "Intermédiaire" in markdown
     assert "Fiche complète" in markdown
     assert markdown_calls == [(saved, markdown_path)]
     assert written_pdf == pdf_path
@@ -663,7 +667,7 @@ def test_export_revision_writes_markdown_and_pdf_from_sqlite(
     assert saved["filename"] in pdf_text
     assert saved["created_at"] in pdf_text
     assert "Français" in pdf_text
-    assert "Débutant" in pdf_text
+    assert "Intermédiaire" in pdf_text
     assert "Fiche complète" in pdf_text
     assert pdf_calls == [(saved, pdf_path)]
     assert len(assistant.llm.prompts) == before["prompts"]

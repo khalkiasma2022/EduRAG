@@ -283,18 +283,19 @@ def test_revision_runs_from_the_pdf_to_the_exports(
         if revision_pipeline_reply(prompt) is not None or "Pages :" in prompt or "Extraits" in prompt
     ]
     assert assistant.llm.calls > calls_before
+    # Analyse intégrale du PDF : toutes les pages du cours sont couvertes.
     assert any(_PAGE_RETENUE in prompt for prompt in revision_prompts)
-    assert all(_PAGE_EXCLUE not in prompt for prompt in revision_prompts)
-    assert all(_PAGE_AUTRE not in prompt for prompt in revision_prompts)
+    assert any(_PAGE_EXCLUE in prompt for prompt in revision_prompts)
+    assert any(_PAGE_AUTRE in prompt for prompt in revision_prompts)
     assert isinstance(saved["id"], int) and saved["id"] > 0
     assert isinstance(saved["created_at"], str) and saved["created_at"].strip() != ""
     assert "Fiche de révision" in saved["content"]
     assert "Explication originale" in saved["content"]
-    assert saved["page_start"] == 2
-    assert saved["page_end"] == 2
+    assert saved["page_start"] == 1
+    assert saved["page_end"] == 3
     assert saved["language"] == "en"
-    assert saved["level"] == "advanced"
-    assert saved["sheet_type"] == "short"
+    assert saved["level"] == "intermediate"
+    assert saved["sheet_type"] == "complete"
     assert assistant.get_revision(saved["id"]) == saved
     assert assistant.list_revisions()[0] == saved
     assert assistant.vector_store._store.index.ntotal == vectors_before
@@ -313,8 +314,8 @@ def test_revision_runs_from_the_pdf_to_the_exports(
     assert saved["filename"] in markdown
     assert saved["created_at"] in markdown
     assert "Anglais" in markdown
-    assert "Avancé" in markdown
-    assert "Fiche courte" in markdown
+    assert "Intermédiaire" in markdown
+    assert "Fiche complète" in markdown
     assert pdf_path.read_bytes().startswith(b"%PDF")
     assert pdf_path.stat().st_size > 0
     assert "Explication originale" in pdf_text or saved["filename"] in pdf_text

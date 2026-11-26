@@ -16,20 +16,7 @@ const LANGUAGES = [
   { value: "ar", label: "العربية" },
 ];
 
-const LEVELS = [
-  { value: "beginner", label: "Débutant" },
-  { value: "intermediate", label: "Intermédiaire" },
-  { value: "advanced", label: "Avancé" },
-];
-
-const SHEET_TYPES = [
-  { value: "short", label: "Fiche courte" },
-  { value: "complete", label: "Fiche complète" },
-];
-
 const LANGUAGE_LABELS = Object.fromEntries(LANGUAGES.map((item) => [item.value, item.label]));
-const LEVEL_LABELS = Object.fromEntries(LEVELS.map((item) => [item.value, item.label]));
-const TYPE_LABELS = Object.fromEntries(SHEET_TYPES.map((item) => [item.value, item.label]));
 
 function apiErrorMessage(error) {
   if (error instanceof ApiError) {
@@ -76,11 +63,6 @@ function Revision() {
   const [revisions, setRevisions] = useState([]);
   const [selectedDocumentId, setSelectedDocumentId] = useState("");
   const [language, setLanguage] = useState("fr");
-  const [level, setLevel] = useState("beginner");
-  const [sheetType, setSheetType] = useState("complete");
-  const [wholeDocument, setWholeDocument] = useState(true);
-  const [pageStart, setPageStart] = useState("1");
-  const [pageEnd, setPageEnd] = useState("1");
   const [activeSheet, setActiveSheet] = useState(null);
   const [loadingDocs, setLoadingDocs] = useState(true);
   const [loadingHistory, setLoadingHistory] = useState(true);
@@ -136,17 +118,6 @@ function Revision() {
     if (!selectedDocumentId) {
       return "Sélectionnez un document PDF.";
     }
-    if (wholeDocument) {
-      return null;
-    }
-    const start = Number(pageStart);
-    const end = Number(pageEnd);
-    if (!Number.isInteger(start) || !Number.isInteger(end)) {
-      return "L'intervalle de pages est invalide.";
-    }
-    if (start < 1 || end < start) {
-      return "L'intervalle de pages est invalide.";
-    }
     return null;
   }
 
@@ -164,20 +135,10 @@ function Revision() {
     setSuccess("");
 
     try {
-      /** @type {{ document_id: string, language: string, level: string, sheet_type: string, page_start?: number, page_end?: number }} */
-      const payload = {
+      const created = await createRevision({
         document_id: selectedDocumentId,
         language,
-        level,
-        sheet_type: sheetType,
-      };
-
-      if (!wholeDocument) {
-        payload.page_start = Number(pageStart);
-        payload.page_end = Number(pageEnd);
-      }
-
-      const created = await createRevision(payload);
+      });
       setActiveSheet(created);
       setSuccess("Fiche générée et enregistrée.");
       await refreshRevisions({ quiet: true });
@@ -239,8 +200,8 @@ function Revision() {
           Smart Revision
         </h1>
         <p className="revision__lead">
-          Générez une fiche de révision à partir d’un cours PDF, puis exportez-la
-          en Markdown ou en PDF sans régénérer le contenu.
+          Générez une fiche structurée sur l’ensemble du cours PDF, puis
+          exportez-la en Markdown ou en PDF sans régénérer le contenu.
         </p>
       </div>
 
@@ -297,92 +258,9 @@ function Revision() {
             </div>
           </fieldset>
 
-          <fieldset className="revision__fieldset" disabled={formLocked}>
-            <legend>Niveau</legend>
-            <div className="revision__options">
-              {LEVELS.map((item) => (
-                <label key={item.value} className="revision__option">
-                  <input
-                    type="radio"
-                    name="revision-level"
-                    value={item.value}
-                    checked={level === item.value}
-                    onChange={() => setLevel(item.value)}
-                  />
-                  <span>{item.label}</span>
-                </label>
-              ))}
-            </div>
-          </fieldset>
-
-          <fieldset className="revision__fieldset" disabled={formLocked}>
-            <legend>Format</legend>
-            <div className="revision__options">
-              {SHEET_TYPES.map((item) => (
-                <label key={item.value} className="revision__option">
-                  <input
-                    type="radio"
-                    name="revision-type"
-                    value={item.value}
-                    checked={sheetType === item.value}
-                    onChange={() => setSheetType(item.value)}
-                  />
-                  <span>{item.label}</span>
-                </label>
-              ))}
-            </div>
-          </fieldset>
-
-          <fieldset className="revision__fieldset" disabled={formLocked}>
-            <legend>Pages</legend>
-            <label className="revision__option">
-              <input
-                type="radio"
-                name="revision-pages"
-                checked={wholeDocument}
-                onChange={() => setWholeDocument(true)}
-              />
-              <span>Tout le document</span>
-            </label>
-            <label className="revision__option">
-              <input
-                type="radio"
-                name="revision-pages"
-                checked={!wholeDocument}
-                onChange={() => setWholeDocument(false)}
-              />
-              <span>Plage de pages</span>
-            </label>
-
-            {!wholeDocument ? (
-              <div className="revision__page-range">
-                <label className="revision__field">
-                  <span>Page de début</span>
-                  <input
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={pageStart}
-                    onChange={(event) => setPageStart(event.target.value)}
-                    disabled={formLocked}
-                    required
-                  />
-                </label>
-                <label className="revision__field">
-                  <span>Page de fin</span>
-                  <input
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={pageEnd}
-                    onChange={(event) => setPageEnd(event.target.value)}
-                    disabled={formLocked}
-                    required
-                  />
-                </label>
-              </div>
-            ) : null}
-          </fieldset>
+          <p className="revision__hint">
+            La fiche couvre automatiquement l’ensemble du document sélectionné.
+          </p>
 
           <button
             type="submit"
@@ -394,7 +272,8 @@ function Revision() {
 
           {generating ? (
             <p className="revision__hint" role="status">
-              Qwen prépare la fiche. Cette étape peut prendre un moment sur le GPU.
+              Qwen analyse le PDF et rédige la fiche. Cette étape peut prendre un
+              moment sur le GPU.
             </p>
           ) : null}
         </form>
@@ -435,8 +314,6 @@ function Revision() {
                         {formatWhen(item.created_at)}
                         {" · "}
                         {labelOf(LANGUAGE_LABELS, item.language)}
-                        {" · "}
-                        {labelOf(TYPE_LABELS, item.sheet_type)}
                       </span>
                       {isOpening ? (
                         <span className="revision__history-status">Ouverture…</span>
@@ -488,7 +365,7 @@ function Revision() {
                 <dd>{activeSheet.filename}</dd>
               </div>
               <div>
-                <dt>Pages</dt>
+                <dt>Couverture</dt>
                 <dd>
                   {activeSheet.page_start === activeSheet.page_end
                     ? `page ${activeSheet.page_start}`
@@ -498,14 +375,6 @@ function Revision() {
               <div>
                 <dt>Langue</dt>
                 <dd>{labelOf(LANGUAGE_LABELS, activeSheet.language)}</dd>
-              </div>
-              <div>
-                <dt>Niveau</dt>
-                <dd>{labelOf(LEVEL_LABELS, activeSheet.level)}</dd>
-              </div>
-              <div>
-                <dt>Format</dt>
-                <dd>{labelOf(TYPE_LABELS, activeSheet.sheet_type)}</dd>
               </div>
               <div>
                 <dt>Créée le</dt>

@@ -64,14 +64,32 @@ class RevisionPublic(BaseModel):
 
 
 class RevisionCreate(BaseModel):
-    """Paramètres d'une nouvelle fiche."""
+    """Paramètres d'une nouvelle fiche.
+
+    Les nouveaux clients n'envoient que ``document_id`` et ``language``.
+    ``level``, ``sheet_type``, ``page_start`` et ``page_end`` restent acceptés
+    pour compatibilité mais sont ignorés : l'analyse porte sur tout le PDF et
+    le stockage utilise les valeurs legacy ``intermediate`` / ``complete``.
+    """
 
     document_id: str = Field(description="Identifiant du cours PDF.")
     language: str = Field(default="fr", description="Langue : fr, en ou ar.")
-    level: str = Field(default="beginner", description="Niveau : beginner, intermediate ou advanced.")
-    sheet_type: str = Field(default="complete", description="Format : short ou complete.")
-    page_start: int | None = Field(default=None, description="Première page. Vide : tout le document.")
-    page_end: int | None = Field(default=None, description="Dernière page. Vide avec la première : tout le document.")
+    level: str = Field(
+        default="beginner",
+        description="Ignoré (compatibilité). Valeur persistée : intermediate.",
+    )
+    sheet_type: str = Field(
+        default="complete",
+        description="Ignoré (compatibilité). Valeur persistée : complete.",
+    )
+    page_start: int | None = Field(
+        default=None,
+        description="Ignoré (compatibilité). L'analyse couvre toujours tout le PDF.",
+    )
+    page_end: int | None = Field(
+        default=None,
+        description="Ignoré (compatibilité). L'analyse couvre toujours tout le PDF.",
+    )
 
 
 router = APIRouter(prefix="/revisions", tags=["revisions"])
@@ -164,7 +182,7 @@ def _export_file(
     summary="Générer une fiche",
     responses={
         201: {"description": "Fiche enregistrée, avec son contenu et ses paramètres."},
-        400: {"description": "Langue, niveau, format ou intervalle de pages refusé."},
+        400: {"description": "Langue refusée ou document inexploitable."},
         404: {"description": "Document introuvable dans la bibliothèque."},
         500: {"description": "La génération de la fiche a échoué."},
     },

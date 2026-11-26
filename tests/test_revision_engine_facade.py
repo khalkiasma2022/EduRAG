@@ -6,7 +6,12 @@ import pytest
 
 from src.revision.engine.facade import RevisionEngine
 from src.revision.engine.formatter import ContentFormatter
-from src.revision.engine.llm_guard import LlmBudgetGuard
+from src.revision.engine.llm_guard import (
+    LEGACY_STORE_LEVEL,
+    LEGACY_STORE_SHEET_TYPE,
+    MAX_ANALYSIS_WINDOWS,
+    LlmBudgetGuard,
+)
 from src.revision.engine.models import (
     ChapterDraft,
     ChapterPlan,
@@ -215,12 +220,11 @@ def _course() -> CourseModel:
     )
 
 
-def _plan(sheet_type: str = "complete", level: str = "beginner", language: str = "fr") -> PedagogicalPlan:
-    depth = "short" if sheet_type == "short" else "complete"
+def _plan(language: str = "fr") -> PedagogicalPlan:
     return PedagogicalPlan(
         language=language,
-        level=level,
-        sheet_type=sheet_type,  # type: ignore[arg-type]
+        level=LEGACY_STORE_LEVEL,
+        sheet_type=LEGACY_STORE_SHEET_TYPE,
         chapters=[
             ChapterPlan(
                 index=0,
@@ -229,8 +233,8 @@ def _plan(sheet_type: str = "complete", level: str = "beginner", language: str =
                 concept_ids=["c_var"],
                 page_refs=[1],
                 needs_example=True,
-                needs_questions=sheet_type == "complete",
-                depth=depth,  # type: ignore[arg-type]
+                needs_questions=False,
+                depth="complete",
             ),
             ChapterPlan(
                 index=1,
@@ -239,8 +243,8 @@ def _plan(sheet_type: str = "complete", level: str = "beginner", language: str =
                 concept_ids=["c_fun"],
                 page_refs=[2],
                 needs_example=True,
-                needs_questions=sheet_type == "complete",
-                depth=depth,  # type: ignore[arg-type]
+                needs_questions=False,
+                depth="complete",
             ),
         ],
     )
@@ -252,8 +256,8 @@ def _document() -> PedagogicalDocument:
         page_start=1,
         page_end=2,
         language="fr",
-        level="beginner",
-        sheet_type="complete",
+        level=LEGACY_STORE_LEVEL,
+        sheet_type=LEGACY_STORE_SHEET_TYPE,
         chapters=[
             ChapterDraft(
                 index=0,
@@ -298,8 +302,6 @@ def _document() -> PedagogicalDocument:
 
 def _build_engine(
     *,
-    sheet_type: str = "complete",
-    level: str = "beginner",
     language: str = "fr",
     quality_fail: bool = False,
     mutate_qc_title: str | None = "Variables QC",
@@ -310,7 +312,7 @@ def _build_engine(
     llm = SharedLLM()
     guard = LlmBudgetGuard()
     course = _course()
-    plan = _plan(sheet_type=sheet_type, level=level, language=language)
+    plan = _plan(language=language)
     document = _document()
     read_result = _read_result()
 
@@ -374,12 +376,12 @@ def test_pipeline_runs_in_order_and_returns_flat_dict() -> None:
         sheet_type="complete",
     )
 
-    assert reader.calls == [("doc-1", 1, 2)]
+    assert reader.calls == [("doc-1", None, None)]
     assert understanding.calls == [reader.result.windows]
     assert planner.calls[0][0] is understanding.course
-    assert planner.calls[0][1:] == ("complete", "beginner", "fr")
+    assert planner.calls[0][1:] == (LEGACY_STORE_SHEET_TYPE, LEGACY_STORE_LEVEL, "fr")
     assert generator.calls[0]["course"] is understanding.course
-    assert generator.calls[0]["plan"].sheet_type == "complete"
+    assert generator.calls[0]["plan"].sheet_type == LEGACY_STORE_SHEET_TYPE
     assert generator.calls[0]["filename"] == "cours.pdf"
     assert generator.calls[0]["source_pages"] == reader.result.pages
     assert quality.calls[0]["document"].filename == "cours.pdf"
@@ -393,8 +395,8 @@ def test_pipeline_runs_in_order_and_returns_flat_dict() -> None:
     assert result["page_start"] == 1
     assert result["page_end"] == 2
     assert result["language"] == "fr"
-    assert result["level"] == "beginner"
-    assert result["sheet_type"] == "complete"
+    assert result["level"] == LEGACY_STORE_LEVEL
+    assert result["sheet_type"] == LEGACY_STORE_SHEET_TYPE
     assert "## Variables QC" in result["content"]
     assert "store" not in result
     assert "id" not in result
@@ -402,22 +404,53 @@ def test_pipeline_runs_in_order_and_returns_flat_dict() -> None:
     assert guard.calls == 3  # understanding + planner + generator
 
 
-def test_short_and_complete_parameters_are_forwarded() -> None:
-    engine, _reader, _u, planner, generator, _q, _f, _g, _llm = _build_engine(
-        sheet_type="short", level="advanced", language="en"
+def test_run_refuses_pdf_exceeding_window_capacity_without_calling_llm() -> None:
+    engine, reader, understanding, planner, generator, quality, formatter, guard, llm = (
+        _build_engine()
+    )
+    oversized = [
+        [CoursePage(page_number=i, text=f"p{i}", filename="cours.pdf")]
+        for i in range(1, MAX_ANALYSIS_WINDOWS + 2)
+    ]
+    reader.result = CourseReadResult(
+        pages=[page for window in oversized for page in window],
+        filename="cours.pdf",
+        page_start=1,
+        page_end=MAX_ANALYSIS_WINDOWS + 1,
+        windows=oversized,
+    )
+
+    with pytest.raises(ValueError, match="capacité|fenêtres"):
+        engine.run("doc-1", language="fr")
+
+    assert understanding.calls == []
+    assert planner.calls == []
+    assert generator.calls == []
+    assert quality.calls == []
+    assert formatter.calls == []
+    assert guard.calls == 0
+    assert llm.generate_calls == 0
+
+
+def test_legacy_params_are_ignored_but_language_is_kept() -> None:
+    engine, reader, _u, planner, generator, _q, _f, _g, _llm = _build_engine(
+        language="en"
     )
     result = engine.run(
         "doc-1",
+        page_start=2,
+        page_end=3,
         language="en",
         level="advanced",
         sheet_type="short",
     )
-    assert planner.calls[0][1:] == ("short", "advanced", "en")
-    assert generator.calls[0]["plan"].sheet_type == "short"
-    assert generator.calls[0]["plan"].level == "advanced"
+    assert reader.calls == [("doc-1", None, None)]
+    assert planner.calls[0][1:] == (LEGACY_STORE_SHEET_TYPE, LEGACY_STORE_LEVEL, "en")
+    assert generator.calls[0]["plan"].sheet_type == LEGACY_STORE_SHEET_TYPE
+    assert generator.calls[0]["plan"].level == LEGACY_STORE_LEVEL
     assert generator.calls[0]["plan"].language == "en"
-    assert result["sheet_type"] == "short"
-    assert result["level"] == "advanced"
+    assert result["sheet_type"] == LEGACY_STORE_SHEET_TYPE
+    assert result["level"] == LEGACY_STORE_LEVEL
     assert result["language"] == "en"
 
 

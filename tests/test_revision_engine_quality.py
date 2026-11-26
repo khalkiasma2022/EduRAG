@@ -10,7 +10,9 @@ from src.revision.engine.llm_guard import (
     LlmBudgetGuard,
     MAX_LLM_CALLS,
     MAX_REWRITE_CHAPTERS,
+    MAX_TOTAL_NEW_TOKENS,
     TOKENS_REWRITE,
+    max_attempts_per_step,
 )
 from src.revision.engine.models import (
     ChapterDraft,
@@ -25,6 +27,7 @@ from src.revision.engine.models import (
     ParagraphBlock,
     PedagogicalDocument,
     PedagogicalPlan,
+    QuestionBlock,
     RetainBlock,
     SynthesisBlock,
 )
@@ -275,6 +278,34 @@ def _fixed_functions_chapter() -> str:
     )
 
 
+def test_strips_question_blocks_without_rewrite() -> None:
+    llm = ScriptedLLM()
+    document = _valid_document()
+    with_question = document.model_copy(
+        update={
+            "chapters": [
+                document.chapters[0].model_copy(
+                    update={
+                        "blocks": list(document.chapters[0].blocks)
+                        + [QuestionBlock(text="Pourquoi nommer une valeur ?", source_pages=[1])]
+                    }
+                ),
+                document.chapters[1],
+            ]
+        }
+    )
+    reviewed, report = QualityController(llm, LlmBudgetGuard()).review(
+        with_question,
+        _course(),
+        _plan(),
+        source_pages=_pages(),
+    )
+    assert report.ok
+    assert llm.calls == 0
+    assert all(block.type != "question" for ch in reviewed.chapters for block in ch.blocks)
+    assert any(block.type == "definition" for block in reviewed.chapters[0].blocks)
+
+
 def test_valid_document_passes_without_llm_rewrite() -> None:
     llm = ScriptedLLM()
     guard = LlmBudgetGuard()
@@ -441,7 +472,7 @@ def test_invented_resolution_of_contradiction_fails_or_is_rewritten() -> None:
             source_pages=[2],
         ),
     )
-    # Réécriture qui persiste à résoudre → échec final.
+    # Réécriture qui persiste à résoudre → échec final (garde exemples/pages).
     still_bad = _rewrite_chapter_json(
         index=1,
         title="Fonctions",
@@ -455,6 +486,17 @@ def test_invented_resolution_of_contradiction_fails_or_is_rewritten() -> None:
             {
                 "type": "definition",
                 "text": "Une fonction encapsule un comportement.",
+                "source_pages": [2],
+            },
+            {
+                "type": "example",
+                "text": "Analogie : une recette qui utilise des ingrédients nommés.",
+                "origin": "pedagogical_addition",
+                "source_pages": [],
+            },
+            {
+                "type": "synthesis",
+                "text": "La fonction s'appuie sur les variables déjà vues.",
                 "source_pages": [2],
             },
         ],
@@ -540,6 +582,17 @@ def test_persistent_defects_after_rewrite_raise() -> None:
                 "text": "Une fonction encapsule un comportement.",
                 "source_pages": [2],
             },
+            {
+                "type": "example",
+                "text": "Analogie : une recette qui utilise des ingrédients nommés.",
+                "origin": "pedagogical_addition",
+                "source_pages": [],
+            },
+            {
+                "type": "synthesis",
+                "text": "La fonction s'appuie sur les variables déjà vues.",
+                "source_pages": [2],
+            },
         ],
     )
     with pytest.raises(ValueError, match="qualité"):
@@ -570,3 +623,189 @@ def test_does_not_return_partial_document_as_valid_on_failure() -> None:
         QualityController(ScriptedLLM(), LlmBudgetGuard()).review(
             document, _course(), _plan(), source_pages=_pages()
         )
+
+
+def _guard_with_remaining(*, tokens: int, calls: int) -> LlmBudgetGuard:
+    """Construit un garde avec exactement `tokens` / `calls` restants."""
+    if tokens < 0 or calls < 0:
+        raise AssertionError("remaining budget invalide")
+    if tokens > MAX_TOTAL_NEW_TOKENS or calls > MAX_LLM_CALLS:
+        raise AssertionError("remaining dépasse les plafonds")
+    guard = LlmBudgetGuard()
+    tokens_to_burn = MAX_TOTAL_NEW_TOKENS - tokens
+    calls_to_burn = MAX_LLM_CALLS - calls
+    if calls_to_burn == 0:
+        assert tokens_to_burn == 0
+        return guard
+    # Chaque reserve consomme 1 appel : répartir tokens_to_burn sur calls_to_burn.
+    assert tokens_to_burn >= calls_to_burn, (
+        "Impossible : trop peu de tokens à brûler pour le nombre d'appels à consommer"
+    )
+    base = tokens_to_burn // calls_to_burn
+    rem = tokens_to_burn % calls_to_burn
+    for index in range(calls_to_burn):
+        chunk = base + (1 if index < rem else 0)
+        guard.reserve(chunk)
+    assert guard.remaining_tokens == tokens
+    assert guard.remaining_calls == calls
+    return guard
+
+
+def _document_with_url_defect(chapter_index: int = 1) -> PedagogicalDocument:
+    document = _valid_document()
+    document.chapters[chapter_index].blocks.insert(
+        0,
+        ParagraphBlock(
+            text=f"Voir https://exemple.invente/ch{chapter_index} pour la suite.",
+            source_pages=[chapter_index + 1],
+        ),
+    )
+    return document
+
+
+def test_rewrite_starts_when_retry_budget_fully_available() -> None:
+    """768 tokens + 2 appels = attempts * TOKENS_REWRITE → une réécriture peut démarrer."""
+    attempts = max_attempts_per_step()
+    assert attempts * TOKENS_REWRITE == 768
+    document = _document_with_url_defect(1)
+    guard = _guard_with_remaining(tokens=768, calls=2)
+    llm = ScriptedLLM([_fixed_functions_chapter()])
+    reviewed, report = QualityController(llm, guard).review(
+        document, _course(), _plan(), source_pages=_pages()
+    )
+    assert report.ok is True
+    assert 1 in report.rewrite_chapter_indexes
+    assert llm.calls == 1
+    # Succès du premier essai : 1 réservation consommée.
+    assert guard.calls == MAX_LLM_CALLS - 2 + 1
+    assert guard.reserved_tokens == MAX_TOTAL_NEW_TOKENS - 768 + TOKENS_REWRITE
+
+
+def test_rewrite_does_not_start_with_767_tokens() -> None:
+    document = _document_with_url_defect(1)
+    guard = _guard_with_remaining(tokens=767, calls=2)
+    llm = ScriptedLLM([_fixed_functions_chapter()])
+    with pytest.raises(ValueError, match="qualité"):
+        QualityController(llm, guard).review(
+            document, _course(), _plan(), source_pages=_pages()
+        )
+    assert llm.calls == 0
+    assert guard.remaining_tokens == 767
+    assert guard.remaining_calls == 2
+
+
+def test_rewrite_does_not_start_with_only_one_call() -> None:
+    document = _document_with_url_defect(1)
+    guard = _guard_with_remaining(tokens=768, calls=1)
+    llm = ScriptedLLM([_fixed_functions_chapter()])
+    with pytest.raises(ValueError, match="qualité"):
+        QualityController(llm, guard).review(
+            document, _course(), _plan(), source_pages=_pages()
+        )
+    assert llm.calls == 0
+    assert guard.remaining_calls == 1
+
+
+def test_two_rewrites_only_when_budget_covers_each_retry_envelope() -> None:
+    """Après une 1ère réécriture réussie, il faut encore 768 tokens / 2 appels."""
+    document = _valid_document()
+    document.chapters[0].blocks.insert(
+        0, ParagraphBlock(text="Voir https://a.example/x", source_pages=[1])
+    )
+    document.chapters[1].blocks.insert(
+        0, ParagraphBlock(text="Voir https://b.example/y", source_pages=[2])
+    )
+    fixed0 = _rewrite_chapter_json(
+        index=0,
+        title="Variables",
+        concept_ids=["c_var"],
+        blocks=[
+            {
+                "type": "paragraph",
+                "text": "On introduit le nommage d'une information utile.",
+                "source_pages": [1],
+            },
+            {
+                "type": "definition",
+                "text": "Une variable stocke une valeur.",
+                "source_pages": [1],
+            },
+            {
+                "type": "example",
+                "text": "Dans le cours : E = 12.",
+                "origin": "from_course",
+                "source_pages": [1],
+            },
+            {
+                "type": "synthesis",
+                "text": "La variable prépare les fonctions.",
+                "source_pages": [1],
+            },
+        ],
+    )
+    # Budget : 1ère rewrite (succès 1 essai) + réserve complète pour la 2ᵉ.
+    # tokens = 384 + 768 = 1152 ; calls = 1 + 2 = 3.
+    guard = _guard_with_remaining(tokens=1152, calls=3)
+    llm = ScriptedLLM([fixed0, _fixed_functions_chapter()])
+    reviewed, report = QualityController(llm, guard).review(
+        document, _course(), _plan(), source_pages=_pages()
+    )
+    assert report.ok is True
+    assert sorted(report.rewrite_chapter_indexes) == [0, 1]
+    assert llm.calls == 2
+
+    # Avec seulement 768 tokens / 2 appels : une seule réécriture, puis échec final.
+    guard_tight = _guard_with_remaining(tokens=768, calls=2)
+    llm_tight = ScriptedLLM([fixed0, _fixed_functions_chapter()])
+    with pytest.raises(ValueError, match="qualité"):
+        QualityController(llm_tight, guard_tight).review(
+            document, _course(), _plan(), source_pages=_pages()
+        )
+    assert llm_tight.calls == 1
+    assert guard_tight.remaining_calls == 1
+    assert guard_tight.remaining_tokens == 768 - TOKENS_REWRITE
+
+
+def test_failed_rewrite_attempt_consumes_retry_budget() -> None:
+    document = _document_with_url_defect(1)
+    attempts = max_attempts_per_step()
+    guard = _guard_with_remaining(
+        tokens=attempts * TOKENS_REWRITE,
+        calls=attempts,
+    )
+    # 1ʳᵉ tentative : couverture réelle invalide → retry ; 2ᵉ : chapitre correct.
+    bare = _rewrite_chapter_json(
+        index=1,
+        title="Fonctions",
+        concept_ids=["c_fun"],
+        blocks=[
+            {
+                "type": "paragraph",
+                "text": "Texte vague sans expliquer la fonction du tout.",
+                "source_pages": [2],
+            }
+        ],
+    )
+    llm = ScriptedLLM([bare, _fixed_functions_chapter()])
+    reviewed, report = QualityController(llm, guard).review(
+        document, _course(), _plan(), source_pages=_pages()
+    )
+    assert report.ok is True
+    assert 1 in report.rewrite_chapter_indexes
+    assert llm.calls == 2
+    assert guard.remaining_calls == 0
+    assert guard.remaining_tokens == 0
+
+
+def test_final_quality_control_always_runs_even_without_rewrite() -> None:
+    """Budget insuffisant → pas de rewrite, mais l'évaluation finale reste obligatoire."""
+    document = _document_with_url_defect(1)
+    guard = _guard_with_remaining(tokens=767, calls=10)
+    llm = ScriptedLLM()
+    with pytest.raises(ValueError, match="après réécriture|qualité"):
+        QualityController(llm, guard).review(
+            document, _course(), _plan(), source_pages=_pages()
+        )
+    assert llm.calls == 0
+    # Document toujours défectueux : le contrôle final a bien rejeté.
+    assert guard.remaining_tokens == 767
