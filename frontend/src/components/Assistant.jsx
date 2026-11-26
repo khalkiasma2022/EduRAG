@@ -7,6 +7,11 @@ import {
   listConversations,
   sendMessage,
 } from "../api/conversations.js";
+import {
+  hostnameFromUrl,
+  partitionSources,
+  shortSnippet,
+} from "../utils/messageSources.js";
 import "./Assistant.css";
 
 function apiErrorMessage(error) {
@@ -42,31 +47,75 @@ function titleFromQuestion(question) {
 }
 
 function MessageSources({ sources }) {
-  if (!Array.isArray(sources) || sources.length === 0) {
+  const { pdf, web } = partitionSources(sources);
+  if (pdf.length === 0 && web.length === 0) {
     return null;
   }
 
   return (
     <div className="assistant__sources">
-      <p className="assistant__sources-title">Sources</p>
-      <ul className="assistant__sources-list">
-        {sources.map((source, index) => (
-          <li
-            key={`${source.chunk_id ?? index}-${source.filename}-${source.page_number}`}
-            className="assistant__source"
-          >
-            <p className="assistant__source-meta">
-              <span className="assistant__source-file">{source.filename}</span>
-              <span className="assistant__source-page">
-                page {source.page_number}
-              </span>
-            </p>
-            {source.text ? (
-              <p className="assistant__source-text">{source.text}</p>
-            ) : null}
-          </li>
-        ))}
-      </ul>
+      {pdf.length > 0 ? (
+        <div className="assistant__sources-group assistant__sources-group--pdf">
+          <p className="assistant__sources-title">Sources PDF</p>
+          <ul className="assistant__sources-list">
+            {pdf.map((source, index) => (
+              <li
+                key={`pdf-${source.chunk_id ?? index}-${source.filename}-${source.page_number}`}
+                className="assistant__source assistant__source--pdf"
+              >
+                <p className="assistant__source-meta">
+                  <span className="assistant__source-file">{source.filename}</span>
+                  <span className="assistant__source-page">
+                    page {source.page_number}
+                  </span>
+                </p>
+                {source.text ? (
+                  <p className="assistant__source-text">{source.text}</p>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {web.length > 0 ? (
+        <div className="assistant__sources-group assistant__sources-group--web">
+          <p className="assistant__sources-title">Sources Web</p>
+          <ol className="assistant__sources-list assistant__sources-list--web">
+            {web.map((source, index) => {
+              const url = String(source.url).trim();
+              const title = String(source.title || hostnameFromUrl(url)).trim();
+              const snippet = shortSnippet(source.snippet);
+              return (
+                <li
+                  key={`web-${index}-${url}`}
+                  className="assistant__source assistant__source--web"
+                >
+                  <p className="assistant__source-meta">
+                    <span className="assistant__source-file">
+                      {index + 1}. {title}
+                    </span>
+                    <span className="assistant__source-domain">
+                      {hostnameFromUrl(url)}
+                    </span>
+                  </p>
+                  <a
+                    className="assistant__source-link"
+                    href={url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    {url}
+                  </a>
+                  {snippet ? (
+                    <p className="assistant__source-text">{snippet}</p>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ol>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -18,7 +18,12 @@ from src.retrieval.vector_store import (
 from src.revision.export import RevisionExport
 from src.revision.sheet import RevisionSheet
 from src.revision.store import RevisionStore
+from src.tutor.direct_chat import DirectChatResponder
+from src.tutor.history_window import HistoryWindow
+from src.tutor.intent_router import GENERAL_CHAT, WEB_QUESTION, IntentRouter
 from src.tutor.store import ConversationStore
+from src.tutor.web_answer import WebAnswerComposer
+from src.tutor.web_search import WebSearcher
 
 
 class EduRAGAssistant:
@@ -54,6 +59,11 @@ class EduRAGAssistant:
             self.vector_store,
             self.llm,
         )
+        self.intent_router = IntentRouter(self.llm)
+        self.direct_chat = DirectChatResponder(self.llm)
+        self.history_window = HistoryWindow()
+        self.web_searcher = WebSearcher()
+        self.web_answer = WebAnswerComposer(self.llm)
         self.revision_sheet = RevisionSheet(self.library, self.llm)
         self.revision_store = RevisionStore(revision_database_path)
         self.revision_export = RevisionExport()
@@ -153,14 +163,31 @@ class EduRAGAssistant:
         question: str,
         top_k: int = 3,
     ) -> dict[str, str | int | dict]:
-        """Enregistre la question, appelle ask() une fois, puis enregistre la réponse.
+        """Enregistre la question, route l'intention, puis enregistre la réponse.
 
-        Les messages précédents ne sont pas transmis au modèle.
+        GENERAL_CHAT → DirectChatResponder (sans FAISS ni Web).
+        COURSE_QUESTION → RAG existant (enrichi seulement pour les suivis).
+        WEB_QUESTION → WebSearcher puis WebAnswerComposer (jamais un repli RAG silencieux).
         Si la réponse échoue, elle n'est pas enregistrée.
         """
-        self.get_conversation(conversation_id)
-        question_message = self.conversation_store.add_message(conversation_id, "user", question)
-        result = self.ask(question, top_k=top_k)
+        conversation = self.get_conversation(conversation_id)
+        history = self.history_window.build(conversation["messages"])
+        question_message = self.conversation_store.add_message(
+            conversation_id,
+            "user",
+            question,
+        )
+        decision = self.intent_router.classify(question, history=history)
+        if decision.intent == GENERAL_CHAT:
+            result = self.direct_chat.reply(question, history=history)
+        elif decision.intent == WEB_QUESTION:
+            result = self._answer_web_question(question, history=history)
+        else:
+            # COURSE_QUESTION (et intentions inattendues traitées comme cours).
+            rag_question = question
+            if self.history_window.should_enrich_rag(question, history):
+                rag_question = self.history_window.enrich_question(question, history)
+            result = self.ask(rag_question, top_k=top_k)
         answer_message = self.conversation_store.add_message(
             conversation_id,
             "assistant",
@@ -172,6 +199,16 @@ class EduRAGAssistant:
             "question": question_message,
             "answer": answer_message,
         }
+
+    def _answer_web_question(
+        self,
+        question: str,
+        *,
+        history: list,
+    ) -> dict[str, str | list]:
+        """Recherche Web réelle puis composition ; pas de repli RAG."""
+        hits = self.web_searcher.search(question)
+        return self.web_answer.compose(question, hits, history=history)
 
     def _open_existing_index(self) -> None:
         """Charge un index valide, ou le reconstruit si des PDF n'ont pas d'index.

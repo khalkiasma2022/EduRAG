@@ -6,7 +6,7 @@ Elles ne construisent ni Qwen, ni MiniLM, ni l'index FAISS.
 
 from __future__ import annotations
 
-from typing import NoReturn, Protocol
+from typing import Literal, NoReturn, Protocol
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -48,13 +48,25 @@ class ConversationPublic(BaseModel):
     created_at: str = Field(description="Date de création, fournie par le stockage.")
 
 
-class SourcePublic(BaseModel):
-    """Passage cité dans une réponse."""
+class PdfSourcePublic(BaseModel):
+    """Passage PDF cité dans une réponse."""
 
     text: str
     filename: str
     page_number: int
     chunk_id: int
+
+
+class WebSourcePublic(BaseModel):
+    """Source Web citée dans une réponse."""
+
+    type: Literal["web"] = "web"
+    title: str
+    url: str
+    snippet: str = ""
+
+
+SourcePublic = PdfSourcePublic | WebSourcePublic
 
 
 class MessagePublic(BaseModel):
@@ -130,20 +142,43 @@ def _conversation_public(entry: object) -> ConversationPublic:
 
 
 def _source_public(source: object) -> SourcePublic:
-    """Garde le passage cité, sans chemin local."""
+    """Garde une source PDF ou Web, sans chemin local."""
     if not isinstance(source, dict):
         raise HTTPException(status_code=500, detail="Les sources enregistrées sont illisibles.")
+    if source.get("type") == "web" or (
+        "url" in source and "filename" not in source and "page_number" not in source
+    ):
+        return _web_source_public(source)
     page_number = source.get("page_number")
     chunk_id = source.get("chunk_id")
     if isinstance(page_number, bool) or not isinstance(page_number, int) or page_number < 1:
         raise HTTPException(status_code=500, detail="Les sources enregistrées sont illisibles.")
     if isinstance(chunk_id, bool) or not isinstance(chunk_id, int) or chunk_id < 1:
         raise HTTPException(status_code=500, detail="Les sources enregistrées sont illisibles.")
-    return SourcePublic(
+    return PdfSourcePublic(
         text=_require_text(source.get("text"), "Les sources enregistrées sont illisibles."),
         filename=_require_text(source.get("filename"), "Les sources enregistrées sont illisibles."),
         page_number=page_number,
         chunk_id=chunk_id,
+    )
+
+
+def _web_source_public(source: dict) -> WebSourcePublic:
+    """Valide une source Web http(s) avant exposition API."""
+    url = source.get("url")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=500, detail="Les sources enregistrées sont illisibles.")
+    title = source.get("title")
+    snippet = source.get("snippet", "")
+    if snippet is None:
+        snippet = ""
+    if not isinstance(snippet, str):
+        raise HTTPException(status_code=500, detail="Les sources enregistrées sont illisibles.")
+    return WebSourcePublic(
+        type="web",
+        title=_require_text(title, "Les sources enregistrées sont illisibles."),
+        url=url.strip(),
+        snippet=snippet,
     )
 
 

@@ -211,6 +211,54 @@ def test_get_conversation_returns_messages_and_sources() -> None:
     assert sent.json()["question"]["content"] == "Où est produite l'énergie ?"
 
 
+def test_get_conversation_returns_web_sources() -> None:
+    client, assistant = _client()
+    conversation_id = assistant.create_conversation("Web")
+    web_source = {
+        "type": "web",
+        "title": "Documentation officielle Python",
+        "url": "https://www.python.org/",
+        "snippet": "Welcome to Python.org",
+    }
+    assistant._add_message(conversation_id, "user", "Nouveautés Python ?", [])
+    assistant._add_message(
+        conversation_id,
+        "assistant",
+        "Voici une synthèse [1].",
+        [web_source],
+    )
+
+    response = client.get(f"/conversations/{conversation_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["messages"][1]["sources"] == [web_source]
+
+
+def test_web_source_with_forbidden_protocol_is_rejected() -> None:
+    client, assistant = _client()
+    conversation_id = assistant.create_conversation("Web invalide")
+    assistant._add_message(conversation_id, "user", "Question", [])
+    assistant._add_message(
+        conversation_id,
+        "assistant",
+        "Réponse",
+        [
+            {
+                "type": "web",
+                "title": "Bad",
+                "url": "javascript:alert(1)",
+                "snippet": "no",
+            }
+        ],
+    )
+
+    response = client.get(f"/conversations/{conversation_id}")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Les sources enregistrées sont illisibles."
+
+
 def test_delete_conversation_removes_its_messages() -> None:
     client, assistant = _client()
     created = client.post("/conversations", json={"title": "À retirer"}).json()

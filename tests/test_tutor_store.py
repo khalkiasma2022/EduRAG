@@ -123,6 +123,29 @@ def test_sources_are_reloaded_from_json_without_calling_a_model(tmp_path: Path) 
     assert store.get_conversation(conversation["id"])["messages"][0]["sources"] == sources
 
 
+def test_web_sources_are_stored_as_json_without_schema_change(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "conversations.sqlite")
+    conversation = store.create_conversation("Web")
+    sources = [
+        {
+            "type": "web",
+            "title": "FastAPI",
+            "url": "https://fastapi.tiangolo.com/",
+            "snippet": "Official docs",
+        }
+    ]
+
+    saved = store.add_message(
+        conversation["id"],
+        "assistant",
+        "Réponse web [1].",
+        sources=sources,
+    )
+
+    assert saved["sources"] == sources
+    assert store.get_conversation(conversation["id"])["messages"][0]["sources"] == sources
+
+
 def test_list_conversations_returns_the_newest_first(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "conversations.sqlite")
     first = store.create_conversation("Ancienne")

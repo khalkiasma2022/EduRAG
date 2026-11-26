@@ -17,6 +17,15 @@ from src.retrieval.vector_store import MANIFEST_NAME
 from src.revision.export import RevisionExport
 from src.revision.sheet import RevisionSheet
 from src.revision.store import RevisionStore
+from src.tutor.direct_chat import DirectChatResponder
+from src.tutor.history_window import HistoryWindow
+from src.tutor.intent_router import (
+    COURSE_QUESTION,
+    GENERAL_CHAT,
+    WEB_QUESTION,
+    IntentRouter,
+    RouteDecision,
+)
 from src.tutor.store import ConversationStore
 
 import src.assistant as assistant_module
@@ -783,14 +792,16 @@ def test_send_message_asks_once_and_saves_the_question_the_answer_and_the_source
 ) -> None:
     assistant, _created = _assistant(tmp_path, monkeypatch)
     conversation_id = assistant.create_conversation("Mitochondrie")
+    _force_intent(assistant, COURSE_QUESTION)
     calls: list[tuple[str, int]] = []
 
     def spy_ask(question: str, top_k: int = 3) -> dict[str, str | list[dict[str, str | int]]]:
         stored = assistant.get_conversation(conversation_id)
         assert stored["messages"][-1]["role"] == "user"
-        assert stored["messages"][-1]["content"] == question
+        # La question stockée reste brute ; ask() peut recevoir un contexte enrichi.
+        assert stored["messages"][-1]["content"] in question
         calls.append((question, top_k))
-        return _answer_for(question, top_k)
+        return _answer_for(stored["messages"][-1]["content"], top_k)
 
     assistant.ask = spy_ask
 
@@ -801,7 +812,11 @@ def test_send_message_asks_once_and_saves_the_question_the_answer_and_the_source
     )
     reopened = assistant.get_conversation(conversation_id)
 
-    assert calls == [("Que produit la mitochondrie ?", 3), ("Sur quelle page ?", 2)]
+    assert calls[0] == ("Que produit la mitochondrie ?", 3)
+    assert calls[1][1] == 2
+    assert "Sur quelle page ?" in calls[1][0]
+    # Deuxième tour : suivi enrichi avec le contexte, sans casser le contrat de stockage.
+    assert "Que produit la mitochondrie ?" in calls[1][0]
     assert first["conversation_id"] == conversation_id
     assert first["question"]["role"] == "user"
     assert first["question"]["content"] == "Que produit la mitochondrie ?"
@@ -810,11 +825,12 @@ def test_send_message_asks_once_and_saves_the_question_the_answer_and_the_source
     assert first["answer"]["content"] == "Réponse à : Que produit la mitochondrie ?"
     assert first["answer"]["sources"] == [_source()]
     assert second["answer"]["sources"] == [_source()]
+    assert second["question"]["content"] == "Sur quelle page ?"
     assert [message["content"] for message in reopened["messages"]] == [
         "Que produit la mitochondrie ?",
         "Réponse à : Que produit la mitochondrie ?",
         "Sur quelle page ?",
-        "Réponse à : Sur quelle page ?",
+        second["answer"]["content"],
     ]
     assert reopened["messages"][1]["sources"] == [_source()]
     assert reopened["messages"][3]["sources"] == [_source()]
@@ -825,6 +841,7 @@ def test_reading_a_conversation_does_not_call_the_model(
 ) -> None:
     assistant, _created = _assistant(tmp_path, monkeypatch)
     conversation_id = assistant.create_conversation("Déjà enregistrée")
+    _force_intent(assistant, COURSE_QUESTION)
     assistant.ask = lambda *args, **kwargs: _answer_for("Question enregistrée")
     assistant.send_message(conversation_id, "Question enregistrée")
     assistant.ask = lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -863,6 +880,7 @@ def test_failed_answer_is_not_saved(
 ) -> None:
     assistant, _created = _assistant(tmp_path, monkeypatch)
     conversation_id = assistant.create_conversation("Échec")
+    _force_intent(assistant, COURSE_QUESTION)
     calls: list[str] = []
 
     def fail_ask(question: str, top_k: int = 3) -> dict[str, str | list]:
@@ -885,6 +903,7 @@ def test_conversation_remains_after_a_new_assistant(
 ) -> None:
     assistant, _created = _assistant(tmp_path, monkeypatch)
     conversation_id = assistant.create_conversation("Persistante")
+    _force_intent(assistant, COURSE_QUESTION)
     assistant.ask = lambda *args, **kwargs: _answer_for("Question conservée")
     assistant.send_message(conversation_id, "Question conservée")
     saved = assistant.get_conversation(conversation_id)
@@ -900,3 +919,324 @@ def test_conversation_remains_after_a_new_assistant(
     assert restarted.list_conversations() == assistant.list_conversations()
     assert restarted.get_conversation(conversation_id) == saved
     assert restarted.llm.prompts == []
+
+
+def _force_intent(assistant: object, intent: str) -> list[str]:
+    """Force IntentRouter.classify à renvoyer une intention fixe."""
+    seen: list[str] = []
+
+    def classify(question: str, history=None) -> RouteDecision:
+        seen.append(question)
+        return RouteDecision(
+            intent=intent,  # type: ignore[arg-type]
+            confidence=0.99,
+            reason="test",
+            used_fallback=False,
+        )
+
+    assistant.intent_router.classify = classify  # type: ignore[method-assign]
+    return seen
+
+
+def test_chat_components_reuse_the_same_llm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, created = _assistant(tmp_path, monkeypatch)
+
+    assert isinstance(assistant.intent_router, IntentRouter)
+    assert isinstance(assistant.direct_chat, DirectChatResponder)
+    assert isinstance(assistant.history_window, HistoryWindow)
+    assert assistant.web_answer.llm is assistant.llm
+    assert assistant.intent_router.llm is assistant.llm
+    assert assistant.direct_chat.llm is assistant.llm
+    assert assistant.intent_router.llm is created["llm"][0]
+    assert len(created["llm"]) == 1
+    assert assistant.web_searcher is not None
+
+
+def test_general_chat_uses_direct_chat_without_rag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("Salutations")
+    classified = _force_intent(assistant, GENERAL_CHAT)
+    ask_calls: list[str] = []
+    reply_calls: list[tuple[str, object]] = []
+
+    def spy_ask(question: str, top_k: int = 3) -> dict[str, str | list]:
+        ask_calls.append(question)
+        return _answer_for(question, top_k)
+
+    def spy_reply(question: str, history=None) -> dict[str, str | list]:
+        reply_calls.append((question, history))
+        return {"answer": "Bonjour !", "sources": []}
+
+    assistant.ask = spy_ask
+    assistant.direct_chat.reply = spy_reply  # type: ignore[method-assign]
+    embedding = created["embedding"][0]
+    store = created["store"][0]
+    queries_before = embedding.query_calls
+    searches_before = store.search_calls
+
+    result = assistant.send_message(conversation_id, "Bonjour")
+    stored = assistant.get_conversation(conversation_id)
+
+    assert classified == ["Bonjour"]
+    assert reply_calls[0][0] == "Bonjour"
+    assert reply_calls[0][1] == []
+    assert ask_calls == []
+    assert embedding.query_calls == queries_before
+    assert store.search_calls == searches_before
+    assert result["answer"]["content"] == "Bonjour !"
+    assert result["answer"]["sources"] == []
+    assert stored["messages"][1]["sources"] == []
+    assert [message["role"] for message in stored["messages"]] == ["user", "assistant"]
+
+
+def test_course_question_keeps_rag_behavior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("Cours")
+    _force_intent(assistant, COURSE_QUESTION)
+    ask_calls: list[tuple[str, int]] = []
+    reply_calls: list[str] = []
+
+    def spy_ask(question: str, top_k: int = 3) -> dict[str, str | list]:
+        ask_calls.append((question, top_k))
+        return _answer_for(question, top_k)
+
+    def spy_reply(question: str, history=None) -> dict[str, str | list]:
+        reply_calls.append(question)
+        return {"answer": "chat", "sources": []}
+
+    assistant.ask = spy_ask
+    assistant.direct_chat.reply = spy_reply  # type: ignore[method-assign]
+
+    result = assistant.send_message(
+        conversation_id,
+        "Explique le concept de virtualisation dans mon cours.",
+        top_k=2,
+    )
+
+    assert ask_calls == [("Explique le concept de virtualisation dans mon cours.", 2)]
+    assert reply_calls == []
+    assert result["answer"]["sources"] == [_source()]
+
+
+def test_web_question_uses_web_search_not_rag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("Web")
+    _force_intent(assistant, WEB_QUESTION)
+    ask_calls: list[str] = []
+    reply_calls: list[str] = []
+    search_calls: list[str] = []
+    compose_calls: list[tuple[str, list]] = []
+    web_sources = [
+        {
+            "type": "web",
+            "title": "Python.org",
+            "url": "https://www.python.org/",
+            "snippet": "News",
+        }
+    ]
+
+    def spy_ask(question: str, top_k: int = 3) -> dict[str, str | list]:
+        ask_calls.append(question)
+        return _answer_for(question, top_k)
+
+    def spy_reply(question: str, history=None) -> dict[str, str | list]:
+        reply_calls.append(question)
+        return {"answer": "chat", "sources": []}
+
+    def spy_search(query: str) -> list[dict[str, str]]:
+        search_calls.append(query)
+        return web_sources
+
+    def spy_compose(question: str, hits, history=None) -> dict[str, str | list]:
+        compose_calls.append((question, hits))
+        return {"answer": "Synthèse web [1].", "sources": hits}
+
+    assistant.ask = spy_ask
+    assistant.direct_chat.reply = spy_reply  # type: ignore[method-assign]
+    assistant.web_searcher.search = spy_search  # type: ignore[method-assign]
+    assistant.web_answer.compose = spy_compose  # type: ignore[method-assign]
+    queries_before = created["embedding"][0].query_calls
+    searches_before = created["store"][0].search_calls
+
+    result = assistant.send_message(
+        conversation_id,
+        "Quelles sont les dernières nouveautés de Python ?",
+    )
+    stored = assistant.get_conversation(conversation_id)
+
+    assert ask_calls == []
+    assert reply_calls == []
+    assert search_calls == ["Quelles sont les dernières nouveautés de Python ?"]
+    assert compose_calls[0][0] == "Quelles sont les dernières nouveautés de Python ?"
+    assert compose_calls[0][1] == web_sources
+    assert created["embedding"][0].query_calls == queries_before
+    assert created["store"][0].search_calls == searches_before
+    assert result["answer"]["content"] == "Synthèse web [1]."
+    assert result["answer"]["sources"] == web_sources
+    assert stored["messages"][1]["sources"] == web_sources
+
+
+def test_web_question_missing_api_key_does_not_fall_back_to_rag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("Web sans clé")
+    _force_intent(assistant, WEB_QUESTION)
+    ask_calls: list[str] = []
+
+    def spy_ask(question: str, top_k: int = 3) -> dict[str, str | list]:
+        ask_calls.append(question)
+        return _answer_for(question, top_k)
+
+    def fail_search(query: str) -> list[dict[str, str]]:
+        raise ValueError(
+            "La recherche Web est indisponible : définissez EDURAG_WEB_SEARCH_API_KEY "
+            "dans votre fichier .env (aucune recherche n'a été effectuée)."
+        )
+
+    assistant.ask = spy_ask
+    assistant.web_searcher.search = fail_search  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="EDURAG_WEB_SEARCH_API_KEY"):
+        assistant.send_message(conversation_id, "Documentation officielle de FastAPI")
+
+    stored = assistant.get_conversation(conversation_id)
+    assert ask_calls == []
+    assert [message["role"] for message in stored["messages"]] == ["user"]
+
+
+def test_general_chat_llm_error_does_not_save_assistant_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("Échec chat")
+    _force_intent(assistant, GENERAL_CHAT)
+
+    def fail_reply(question: str, history=None) -> dict[str, str | list]:
+        raise RuntimeError("La génération de la réponse a échoué.")
+
+    assistant.ask = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("GENERAL_CHAT ne doit pas appeler ask().")
+    )
+    assistant.direct_chat.reply = fail_reply  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="génération"):
+        assistant.send_message(conversation_id, "Comment vas-tu ?")
+
+    stored = assistant.get_conversation(conversation_id)
+    assert [message["role"] for message in stored["messages"]] == ["user"]
+    assert stored["messages"][0]["content"] == "Comment vas-tu ?"
+
+
+def test_general_chat_never_calls_embed_or_faiss_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Avec le vrai IntentRouter + FakeLLM, une salutation évite le RAG."""
+    assistant, created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("E2E général")
+    embedding = created["embedding"][0]
+    store = created["store"][0]
+    queries_before = embedding.query_calls
+    searches_before = store.search_calls
+
+    result = assistant.send_message(conversation_id, "Bonjour")
+    stored = assistant.get_conversation(conversation_id)
+
+    assert embedding.query_calls == queries_before
+    assert store.search_calls == searches_before
+    assert result["answer"]["sources"] == []
+    assert stored["messages"][1]["sources"] == []
+    assert result["answer"]["content"]
+    assert "filename" not in result["answer"]["content"].lower()
+
+
+def test_follow_up_passes_history_to_direct_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("Suivi")
+    _force_intent(assistant, GENERAL_CHAT)
+    histories: list[object] = []
+
+    def spy_reply(question: str, history=None) -> dict[str, str | list]:
+        histories.append(history)
+        return {"answer": f"ok:{question}", "sources": []}
+
+    assistant.direct_chat.reply = spy_reply  # type: ignore[method-assign]
+    assistant.ask = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("GENERAL_CHAT ne doit pas appeler ask().")
+    )
+
+    assistant.send_message(conversation_id, "Explique-moi Python.")
+    assistant.send_message(conversation_id, "Donne-moi trois exemples.")
+
+    assert histories[0] == []
+    assert histories[1] is not None
+    assert [item["content"] for item in histories[1]] == [  # type: ignore[index]
+        "Explique-moi Python.",
+        "ok:Explique-moi Python.",
+    ]
+    # Le message actuel n'est pas dupliqué dans l'historique transmis.
+    assert "Donne-moi trois exemples." not in [
+        item["content"] for item in histories[1]  # type: ignore[index]
+    ]
+
+
+def test_follow_up_enriches_rag_question_with_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    conversation_id = assistant.create_conversation("RAG suivi")
+    _force_intent(assistant, COURSE_QUESTION)
+    ask_calls: list[str] = []
+
+    def spy_ask(question: str, top_k: int = 3) -> dict[str, str | list]:
+        ask_calls.append(question)
+        return _answer_for(question, top_k)
+
+    assistant.ask = spy_ask
+    assistant.send_message(conversation_id, "Explique-moi Python dans mon cours.")
+    assistant.send_message(conversation_id, "Donne-moi trois exemples.")
+
+    assert ask_calls[0] == "Explique-moi Python dans mon cours."
+    assert "Donne-moi trois exemples." in ask_calls[1]
+    assert "Explique-moi Python dans mon cours." in ask_calls[1]
+    assert ask_calls[1].count("Donne-moi trois exemples.") == 1
+
+
+def test_conversations_keep_separate_histories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assistant, _created = _assistant(tmp_path, monkeypatch)
+    first = assistant.create_conversation("A")
+    second = assistant.create_conversation("B")
+    _force_intent(assistant, GENERAL_CHAT)
+    seen: list[tuple[str, list[str]]] = []
+
+    def spy_reply(question: str, history=None) -> dict[str, str | list]:
+        contents = [item["content"] for item in (history or [])]
+        seen.append((question, contents))
+        return {"answer": f"réponse:{question}", "sources": []}
+
+    assistant.direct_chat.reply = spy_reply  # type: ignore[method-assign]
+    assistant.ask = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("GENERAL_CHAT ne doit pas appeler ask().")
+    )
+
+    assistant.send_message(first, "Sujet A")
+    assistant.send_message(second, "Sujet B")
+    assistant.send_message(first, "Suite A")
+
+    assert seen[0] == ("Sujet A", [])
+    assert seen[1] == ("Sujet B", [])
+    assert seen[2][0] == "Suite A"
+    assert "Sujet A" in seen[2][1]
+    assert "Sujet B" not in seen[2][1]

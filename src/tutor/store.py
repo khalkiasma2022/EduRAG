@@ -218,6 +218,9 @@ def _validate_sources(role: str, sources: object) -> list[dict[str, str | int]]:
 
     Un message d'étudiant n'a pas de sources. Une réponse peut en avoir une liste,
     éventuellement vide lorsque aucun passage n'a été retenu.
+    Formats acceptés :
+    - PDF : text, filename, page_number, chunk_id
+    - Web : type=web, title, url, snippet
     """
     if sources is None:
         sources = []
@@ -230,6 +233,11 @@ def _validate_sources(role: str, sources: object) -> list[dict[str, str | int]]:
     for source in sources:
         if not isinstance(source, dict):
             raise ValueError("Les sources du message sont invalides.")
+        if source.get("type") == "web" or (
+            "url" in source and "filename" not in source and "page_number" not in source
+        ):
+            stored.append(_validate_web_source(source))
+            continue
         text = source.get("text")
         filename = source.get("filename")
         page_number = source.get("page_number")
@@ -249,6 +257,27 @@ def _validate_sources(role: str, sources: object) -> list[dict[str, str | int]]:
             }
         )
     return stored
+
+
+def _validate_web_source(source: dict) -> dict[str, str | int]:
+    """Valide une source Web sans inventer d'URL."""
+    url = source.get("url")
+    title = source.get("title")
+    snippet = source.get("snippet", "")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        raise ValueError("Les sources du message sont invalides.")
+    if not isinstance(title, str) or title.strip() == "":
+        raise ValueError("Les sources du message sont invalides.")
+    if snippet is None:
+        snippet = ""
+    if not isinstance(snippet, str):
+        raise ValueError("Les sources du message sont invalides.")
+    return {
+        "type": "web",
+        "title": title.strip(),
+        "url": url.strip(),
+        "snippet": snippet,
+    }
 
 
 def _is_positive_int(value: object) -> bool:
