@@ -19,6 +19,12 @@ from src.revision.engine.llm_guard import (
     ensure_generation_capacity,
     ensure_prompt_fits,
 )
+from src.revision.engine.near_copy import (
+    full_source_corpus,
+    is_near_copy,
+    page_source_corpus,
+    whitelist_terms,
+)
 from src.revision.engine.models import (
     ChapterDraft,
     ChapterPlan,
@@ -78,7 +84,8 @@ class OriginalContentGenerator:
         ensure_generation_capacity(self.guard, chapters=len(plan.chapters))
 
         pages = list(source_pages or [])
-        source_text = _source_corpus(course, pages)
+        source_text = full_source_corpus(course, pages)
+        page_source_text = page_source_corpus(course, pages)
         previous_titles: list[str] = []
         drafts: list[ChapterDraft] = []
 
@@ -90,6 +97,7 @@ class OriginalContentGenerator:
                 previous_titles=previous_titles,
                 source_pages=pages,
                 source_text=source_text,
+                page_source_text=page_source_text,
             )
             drafts.append(draft)
             previous_titles.append(draft.title)
@@ -113,6 +121,7 @@ class OriginalContentGenerator:
         previous_titles: list[str],
         source_pages: list[CoursePage],
         source_text: str,
+        page_source_text: str,
     ) -> ChapterDraft:
         # Refuse avant appel LLM si la densité dépasse le budget 640 tokens.
         ensure_chapter_density(len(chapter_plan.concept_ids))
@@ -129,16 +138,27 @@ class OriginalContentGenerator:
             ensure_prompt_fits(self.llm, prompt, tokens)
             return self.llm.generate(prompt, max_new_tokens=tokens)
 
+        def parse(raw: str) -> ChapterDraft:
+            draft = _parse_chapter_draft(raw, expected_index=chapter_plan.index)
+            # Retry uniquement pour near-copy (les autres erreurs sortent après).
+            _reject_near_copy_paragraphs(
+                draft,
+                course=course,
+                page_source_text=page_source_text,
+            )
+            return draft
+
         draft = self.guard.run_with_retries(
             produce,
             tokens=tokens,
-            parse=lambda raw: _parse_chapter_draft(raw, expected_index=chapter_plan.index),
+            parse=parse,
         )
         _validate_chapter_draft(
             draft,
             chapter_plan=chapter_plan,
             course=course,
             source_text=source_text,
+            page_source_text=page_source_text,
         )
         return draft
 
@@ -193,9 +213,17 @@ def _build_chapter_prompt(
         f"{language_line}\n"
         f"{style}\n"
         "Règles strictes :\n"
-        "- Reformule de façon originale : n'copie pas le PDF.\n"
+        "- Reformule de façon originale : n'copie pas le PDF ; change l'ordre des idées "
+        "et le vocabulaire de liaison, sans coller des phrases du document.\n"
         "- N'invente aucune formule, valeur numérique, définition technique ou fait "
         "scientifique absent des pages/concepts fournis.\n"
+        "- Pour CHAQUE concept listé dans Concepts (essentiel ou secondaire), fournis "
+        "une explication pédagogique réelle dans un bloc paragraph ou definition : "
+        "ne te contente pas de mentionner le nom ou le titre. Appuie-toi sur les notes "
+        "et sur les extraits de TOUTES les pages listées pour ce concept "
+        "(définitions, propriétés, exemples, comparaisons disponibles) ; "
+        "n'invente rien pour forcer la couverture.\n"
+        "- concept_ids_covered doit contenir tous les identifiants de Concepts du chapitre.\n"
         "- Distingue origin=from_course et origin=pedagogical_addition pour les exemples.\n"
         "- Si une CONTRADICTION apparaît dans les notes, signale-la sans la résoudre.\n"
         "- Interdit : URL, bibliographie, contact, remerciements, listes de mots-clés vides.\n"
@@ -284,6 +312,7 @@ def _validate_chapter_draft(
     chapter_plan: ChapterPlan,
     course: CourseModel,
     source_text: str,
+    page_source_text: str,
 ) -> None:
     if not draft.blocks:
         raise ValueError("Le chapitre généré est vide ou incomplet.")
@@ -297,12 +326,7 @@ def _validate_chapter_draft(
             "Le chapitre ne couvre pas les concepts essentiels demandés par le plan."
         )
 
-    unexplained = validate_chapter_concept_coverage(
-        draft, chapter_plan=chapter_plan, course=course
-    )
-    if unexplained:
-        raise ValueError(coverage_failure_message(unexplained))
-
+    # Interdits structurels avant la couverture (message d'erreur plus précis).
     if any(block.type == "question" for block in draft.blocks):
         raise ValueError(
             "Une fiche de révision ne doit pas contenir de questions de révision."
@@ -318,11 +342,6 @@ def _validate_chapter_draft(
         for text in texts:
             if _URL_RE.search(text):
                 raise ValueError("Contenu interdit : URL inventée ou non autorisée.")
-            if isinstance(block, ParagraphBlock) and _is_near_copy(text, source_text):
-                raise ValueError(
-                    "Le paragraphe est trop proche d'une copie du document ; "
-                    "une rédaction originale est exigée."
-                )
             if has_contradiction and _RESOLVING_RE.search(text):
                 raise ValueError(
                     "Résolution inventée d'une contradiction : le générateur doit "
@@ -337,6 +356,36 @@ def _validate_chapter_draft(
             ):
                 raise ValueError(
                     "invention détectée : valeur numérique absente des sources du cours."
+                )
+
+    _reject_near_copy_paragraphs(
+        draft,
+        course=course,
+        page_source_text=page_source_text,
+    )
+
+    unexplained = validate_chapter_concept_coverage(
+        draft, chapter_plan=chapter_plan, course=course
+    )
+    if unexplained:
+        raise ValueError(coverage_failure_message(unexplained))
+
+
+def _reject_near_copy_paragraphs(
+    draft: ChapterDraft,
+    *,
+    course: CourseModel,
+    page_source_text: str,
+) -> None:
+    whitelist = whitelist_terms(course)
+    for block in draft.blocks:
+        if not isinstance(block, ParagraphBlock):
+            continue
+        for text in _block_texts(block):
+            if is_near_copy(text, page_source_text, whitelist=whitelist):
+                raise ValueError(
+                    "Le paragraphe est trop proche d'une copie du document ; "
+                    "une rédaction originale est exigée."
                 )
 
 
@@ -366,35 +415,13 @@ def _invented_numbers(text: str, source_text: str) -> list[str]:
     return found
 
 
-def _is_near_copy(text: str, source_text: str) -> bool:
-    normalized = _normalize(text)
-    source_norm = _normalize(source_text)
-    if len(normalized) < 40:
-        return False
-    if normalized in source_norm:
-        return True
-    # Recouvrement fort par fenêtres de mots
-    words = normalized.split()
-    if len(words) < 8:
-        return False
-    window = 8
-    for start in range(0, len(words) - window + 1):
-        chunk = " ".join(words[start : start + window])
-        if chunk in source_norm:
-            return True
-    return False
-
-
 def _normalize(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
 def _source_corpus(course: CourseModel, pages: list[CoursePage]) -> str:
-    parts: list[str] = [page.text for page in pages]
-    parts.extend(unit.text for unit in course.units)
-    parts.extend(concept.notes for concept in course.concepts if concept.notes)
-    parts.extend(concept.label for concept in course.concepts)
-    return "\n".join(parts)
+    """Compatibilité : corpus large (pages + notes + labels)."""
+    return full_source_corpus(course, pages)
 
 
 def _load_json_object(raw: str) -> dict[str, Any]:

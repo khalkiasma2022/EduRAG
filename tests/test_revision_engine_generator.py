@@ -654,6 +654,89 @@ def test_near_copy_of_source_paragraph_is_rejected() -> None:
         )
 
 
+def test_near_copy_retries_then_accepts_original_rewrite() -> None:
+    """Une 1ʳᵉ tentative trop proche du PDF peut être corrigée au retry."""
+    copied = _chapter_json(
+        index=0,
+        title="Variables",
+        concept_ids=["c_var"],
+        blocks=[
+            {
+                "type": "paragraph",
+                "text": "Une variable stocke une valeur. Formule : E = 12.",
+                "source_pages": [1],
+            },
+            {
+                "type": "definition",
+                "text": "Une variable stocke une valeur.",
+                "source_pages": [1],
+            },
+            {
+                "type": "synthesis",
+                "text": "Retenir qu'une variable nomme une valeur.",
+                "source_pages": [1],
+            },
+        ],
+    )
+    fixed = _short_chapter_var()
+    fun = _short_chapter_fun()
+    llm = ScriptedLLM([copied, fixed, fun])
+    document = OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
+        _course(),
+        _plan(),
+        filename="cours.pdf",
+        page_start=1,
+        page_end=2,
+        source_pages=_pages(),
+    )
+    assert len(document.chapters) == 2
+    assert llm.calls >= 2
+
+
+def test_concept_notes_alone_do_not_trigger_near_copy() -> None:
+    """Les notes de concepts (souvent reprises du PDF) ne forment plus le corpus anti-copie."""
+    from src.revision.engine.near_copy import is_near_copy, page_source_corpus, whitelist_terms
+
+    course = _course()
+    # Notes = phrase longue du cours ; absente des pages fournies à ce test.
+    course.concepts[0].notes = (
+        "Formulation technique issue de l'analyse : une variable associe un identifiant "
+        "durable a une valeur stockee en memoire pendant l'execution."
+    )
+    pages = _pages()
+    page_corpus = page_source_corpus(course, pages)
+    paragraph = (
+        "Formulation technique issue de l'analyse : une variable associe un identifiant "
+        "durable a une valeur stockee en memoire pendant l'execution."
+    )
+    # Corpus pages-only : la phrase n'est pas dans les pages → pas near-copy.
+    assert paragraph.casefold() not in page_corpus.casefold()
+    assert not is_near_copy(
+        paragraph, page_corpus, whitelist=whitelist_terms(course)
+    )
+
+
+def test_generator_accepts_original_paragraph_despite_long_concept_notes() -> None:
+    """Notes ≈ PDF ne doivent pas faire échouer une rédaction originale."""
+    course = _course()
+    course.concepts[0].notes = (
+        "Une variable stocke une valeur. Formule : E = 12. "
+        "On retient aussi qu'un identifiant durable pointe vers une case memoire."
+    )
+    original = _short_chapter_var()
+    fun = _short_chapter_fun()
+    llm = ScriptedLLM([original, fun])
+    document = OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
+        course,
+        _plan(),
+        filename="cours.pdf",
+        page_start=1,
+        page_end=2,
+        source_pages=_pages(),
+    )
+    assert len(document.chapters) == 2
+
+
 def test_chapter_prompt_documents_exact_block_types_without_pipe_union() -> None:
     plan = _plan()
     prompt = _build_chapter_prompt(

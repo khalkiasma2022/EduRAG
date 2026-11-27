@@ -212,6 +212,103 @@ def test_keeps_near_but_distinct_concepts() -> None:
     assert "variable globale" in labels
 
 
+def test_merges_complementary_notes_across_windows_without_false_contradiction() -> None:
+    """Deux explications complémentaires du même concept → notes fusionnées, pages unies."""
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Biologie"],
+                concepts=[
+                    {
+                        "id": "c_photo",
+                        "label": "photosynthèse",
+                        "kind": "definition",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "Processus par lequel les plantes convertissent la lumière en énergie chimique.",
+                    }
+                ],
+            ),
+            _window_payload(
+                themes=["Biologie"],
+                concepts=[
+                    {
+                        "id": "c_photo_alias",
+                        "label": "photosynthèse",
+                        "kind": "definition",
+                        "pages": [4, 5],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": (
+                            "Étapes principales : captation de la lumière, fixation du CO2, "
+                            "production de glucose. Aussi appelée assimilation chlorophyllienne."
+                        ),
+                        "same_as": "c_photo",
+                    }
+                ],
+            ),
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze(
+        [[_page(1, "intro photo")], [_page(4, "etapes"), _page(5, "alias")]]
+    )
+    assert len(model.concepts) == 1
+    concept = model.concepts[0]
+    assert concept.id == "c_photo"
+    assert concept.pages == [1, 4, 5]
+    assert "CONTRADICTION" not in concept.notes.upper()
+    assert "lumière" in concept.notes.casefold() or "lumiere" in concept.notes.casefold()
+    assert "glucose" in concept.notes.casefold()
+    assert "assimilation chlorophyllienne" in concept.notes.casefold()
+
+
+def test_empty_then_rich_notes_preserve_multi_window_content() -> None:
+    """Fenêtre titre (notes vides) puis fenêtre définition → conserver le fond pédagogique."""
+    llm = ScriptedLLM(
+        [
+            _window_payload(
+                themes=["Droit"],
+                concepts=[
+                    {
+                        "id": "habeas-corpus",
+                        "label": "Habeas Corpus",
+                        "kind": "definition",
+                        "pages": [1],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": "",
+                    }
+                ],
+            ),
+            _window_payload(
+                themes=["Droit"],
+                concepts=[
+                    {
+                        "id": "habeas-corpus",
+                        "label": "Habeas Corpus",
+                        "kind": "definition",
+                        "pages": [8, 9],
+                        "essential": True,
+                        "depends_on": [],
+                        "notes": (
+                            "Garantie procédurale contre la détention arbitraire. "
+                            "Aussi appelée writ of habeas corpus."
+                        ),
+                    }
+                ],
+            ),
+        ]
+    )
+    model = CourseUnderstanding(llm, LlmBudgetGuard()).analyze(
+        [[_page(1, "Sommaire Habeas Corpus")], [_page(8, "def"), _page(9, "suite")]]
+    )
+    concept = next(c for c in model.concepts if c.id == "habeas-corpus")
+    assert concept.pages == [1, 8, 9]
+    assert "détention" in concept.notes.casefold() or "detention" in concept.notes.casefold()
+    assert "CONTRADICTION" not in concept.notes.upper()
+
+
 def test_marks_contradiction_without_inventing_resolution() -> None:
     llm = ScriptedLLM(
         [
@@ -376,6 +473,8 @@ def test_prompt_forbids_invented_kind_categories() -> None:
     assert "service" in prompt.casefold()
     assert "technology" in prompt.casefold()
     assert "sans Markdown" in prompt
+    assert "expliquent vraiment" in prompt.casefold() or "explique" in prompt.casefold()
+    assert "synonymes" in prompt.casefold() or "formulations alternatives" in prompt.casefold()
     assert "service" not in _KIND_VALUES
 
 

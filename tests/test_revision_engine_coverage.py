@@ -24,6 +24,7 @@ from src.revision.engine.models import (
     PedagogicalDocument,
     PedagogicalPlan,
     SynthesisBlock,
+    TableBlock,
 )
 from src.revision.engine.quality import QualityController
 
@@ -459,7 +460,8 @@ def test_generator_rejects_declared_ids_without_real_explanation() -> None:
             },
         ],
     )
-    llm = ScriptedLLM([bad])
+    # Validation dans parse → chaque tentative consomme une réponse.
+    llm = ScriptedLLM([bad] * max_attempts_per_step())
     llm.tokenizer = _FakeTokenizer()
     llm.model = _FakeModel()
     with pytest.raises(ValueError, match="Couverture|expliqué"):
@@ -471,3 +473,296 @@ def test_generator_rejects_declared_ids_without_real_explanation() -> None:
             page_end=1,
             source_pages=_pages(),
         )
+
+
+def _generic_concept(
+    *,
+    cid: str,
+    label: str,
+    kind: str = "definition",
+    notes: str = "",
+    essential: bool = True,
+) -> Concept:
+    return Concept(
+        id=cid,
+        label=label,
+        kind=kind,  # type: ignore[arg-type]
+        pages=[1],
+        essential=essential,
+        notes=notes,
+    )
+
+
+def test_hyphen_and_dash_variants_of_multiword_label_are_accepted() -> None:
+    concept = _generic_concept(
+        cid="cloud-computing",
+        label="Cloud Computing",
+        notes=(
+            "Modele d acces a la demande a des ressources informatiques partagees. "
+            "Aussi appele informatique en nuage."
+        ),
+    )
+    assert concept_is_explained(
+        concept,
+        "Le cloud-computing est un modele qui fournit des ressources a la demande via Internet.",
+    )
+    assert concept_is_explained(
+        concept,
+        "Le Cloud–Computing est un modele qui fournit des ressources a la demande via Internet.",
+    )
+    assert concept_is_explained(
+        concept,
+        "Cloud Computing: acces ubiquitaire a un ensemble partage de ressources configurables.",
+    )
+
+
+def test_note_alias_synonym_is_accepted_without_exact_label() -> None:
+    concept = _generic_concept(
+        cid="cloud-computing",
+        label="Cloud Computing",
+        notes=(
+            "Modele d acces a la demande a des ressources informatiques partagees. "
+            "Aussi appele informatique en nuage."
+        ),
+    )
+    assert concept_is_explained(
+        concept,
+        "L'informatique en nuage designe un mode de fourniture de ressources a la demande.",
+    )
+
+
+def test_nbsp_and_punctuation_variants_are_accepted() -> None:
+    concept = _generic_concept(
+        cid="machine-learning",
+        label="Machine Learning",
+        notes="Apprentissage automatique a partir de donnees.",
+    )
+    assert concept_is_explained(
+        concept,
+        "Le Machine\u00a0Learning est une methode qui apprend des motifs a partir de donnees.",
+    )
+    assert concept_is_explained(
+        concept,
+        "«Machine Learning» : methode qui apprend des motifs a partir de donnees.",
+    )
+
+
+def test_english_and_arabic_formulations_are_accepted() -> None:
+    en = _generic_concept(
+        cid="load-balancer",
+        label="load balancer",
+        kind="mechanism",
+        notes="Also known as traffic distributor. Spreads requests across servers.",
+    )
+    ar = _generic_concept(
+        cid="khawarizmiya",
+        label="خوارزمية",
+        kind="method",
+        notes="سلسلة خطوات لحل مسألة.",
+    )
+    assert concept_is_explained(
+        en,
+        "A traffic distributor spreads incoming requests across several backend servers.",
+    )
+    assert concept_is_explained(
+        ar,
+        "الخوارزمية هي سلسلة خطوات واضحة تسمح بحل مسألة بشكل منظم.",
+    )
+
+
+def test_table_and_definition_blocks_count_as_explanation() -> None:
+    concept = _generic_concept(
+        cid="iaas",
+        label="IaaS",
+        notes="Infrastructure as a Service. Fournit des ressources virtualisees.",
+    )
+    draft = ChapterDraft(
+        index=0,
+        title="Cloud",
+        concept_ids_covered=["iaas"],
+        blocks=[
+            DefinitionBlock(
+                text="Infrastructure as a Service fournit des machines a la demande.",
+                source_pages=[1],
+            ),
+            TableBlock(
+                headers=["Offre", "Role"],
+                rows=[["IaaS", "ressources virtualisees"]],
+                source_pages=[1],
+            ),
+        ],
+    )
+    plan = ChapterPlan(
+        index=0,
+        title="Cloud",
+        concept_ids=["iaas"],
+        page_refs=[1],
+        depth="complete",
+    )
+    course = CourseModel(concepts=[concept], essential_concept_ids=["iaas"])
+    assert validate_chapter_concept_coverage(
+        draft, chapter_plan=plan, course=course
+    ) == []
+
+
+def test_mere_mention_or_title_only_is_still_rejected() -> None:
+    concept = _generic_concept(
+        cid="cloud-computing",
+        label="Cloud Computing",
+        notes="Modele d acces a la demande a des ressources informatiques partagees.",
+    )
+    assert not concept_is_explained(
+        concept,
+        "Titre seul : Cloud Computing",
+    )
+    assert not concept_is_explained(
+        concept,
+        "Le cloud transforme l'informatique en service consomme et facture.",
+    )
+
+
+def test_declared_id_without_explanation_still_fails_validation() -> None:
+    concept = _generic_concept(
+        cid="photosynthesis",
+        label="photosynthesis",
+        notes="Process by which plants convert light into chemical energy.",
+    )
+    draft = ChapterDraft(
+        index=0,
+        title="Biology",
+        concept_ids_covered=["photosynthesis"],
+        blocks=[
+            ParagraphBlock(
+                text="This chapter introduces several ideas about living systems in general.",
+                source_pages=[1],
+            )
+        ],
+    )
+    plan = ChapterPlan(
+        index=0,
+        title="Biology",
+        concept_ids=["photosynthesis"],
+        page_refs=[1],
+        depth="complete",
+    )
+    course = CourseModel(concepts=[concept], essential_concept_ids=["photosynthesis"])
+    missing = validate_chapter_concept_coverage(
+        draft, chapter_plan=plan, course=course
+    )
+    assert [c.id for c in missing] == ["photosynthesis"]
+
+
+def test_generic_multiword_slug_concept_regression() -> None:
+    """Régression générique : id slug + label multi-mots + formulation tiretée."""
+    concept = _generic_concept(
+        cid="operating-system",
+        label="Operating System",
+        notes="Software layer that manages hardware and processes. Also known as OS kernel host.",
+    )
+    assert concept_is_explained(
+        concept,
+        "An operating-system manages hardware resources and schedules processes for applications.",
+    )
+    assert concept_is_explained(
+        concept,
+        "The OS kernel host coordinates memory, CPU and devices for user programs.",
+    )
+
+
+def test_title_only_in_long_paragraph_is_still_rejected_for_definition() -> None:
+    """Mention du label dans un long texte sans marqueur définitoire → non couvert."""
+    concept = _generic_concept(
+        cid="mitosis",
+        label="mitosis",
+        notes="Cell division that produces two genetically identical daughter cells.",
+    )
+    corpus = (
+        "This chapter surveys several school topics. Mitosis. Later we discuss geography, "
+        "literature history and unrelated administrative procedures without explaining the term."
+    )
+    assert not concept_is_explained(concept, corpus)
+
+
+def test_synonym_reformulation_from_merged_notes_counts_as_coverage() -> None:
+    concept = _generic_concept(
+        cid="photosynthesis",
+        label="photosynthesis",
+        notes=(
+            "Process by which plants convert light into chemical energy.\n"
+            "Aussi appelée assimilation chlorophyllienne."
+        ),
+    )
+    corpus = (
+        "L'assimilation chlorophyllienne permet aux végétaux de transformer la lumière "
+        "en énergie chimique stockée sous forme de glucose."
+    )
+    assert concept_is_explained(concept, corpus) is True
+
+
+def test_generated_chapter_covers_essential_with_real_explanation() -> None:
+    course = CourseModel(
+        concepts=[
+            Concept(
+                id="ohm-law",
+                label="loi d'Ohm",
+                kind="formula",
+                pages=[2, 3],
+                essential=True,
+                notes="U = R * I. Relie tension, résistance et intensité.",
+            )
+        ],
+        essential_concept_ids=["ohm-law"],
+    )
+    plan = _plan_single(["ohm-law"], title="Électricité")
+    good = _chapter_json(
+        concept_ids=["ohm-law"],
+        title="Électricité",
+        blocks=[
+            {
+                "type": "paragraph",
+                "text": (
+                    "La loi d'Ohm relie la tension U à la résistance R et à l'intensité I "
+                    "selon la relation U = R * I présentée dans le cours."
+                ),
+                "source_pages": [2, 3],
+            },
+            {
+                "type": "definition",
+                "text": "U = R * I. Relie tension, résistance et intensité.",
+                "source_pages": [2],
+            },
+            {
+                "type": "synthesis",
+                "text": "Retenir que tension, résistance et courant sont liés par Ohm.",
+                "source_pages": [3],
+            },
+        ],
+    )
+    document = OriginalContentGenerator(
+        ScriptedLLM([good]),
+        LlmBudgetGuard(),
+    ).generate(
+        course,
+        plan,
+        filename="cours.pdf",
+        page_start=2,
+        page_end=3,
+        source_pages=[
+            CoursePage(
+                page_number=2,
+                text="U = R * I. Relie tension, résistance et intensité.",
+                filename="cours.pdf",
+            ),
+            CoursePage(
+                page_number=3,
+                text="La loi d'Ohm structure l'analyse des circuits simples.",
+                filename="cours.pdf",
+            ),
+        ],
+    )
+    unexplained = validate_chapter_concept_coverage(
+        document.chapters[0],
+        chapter_plan=plan.chapters[0],
+        course=course,
+    )
+    assert unexplained == []

@@ -174,6 +174,17 @@ def _build_understanding_prompt(window: list[CoursePage]) -> str:
         "Aucune autre valeur n'est autorisée pour kind.\n"
         "Pour une notion de type service informatique (PaaS, IaaS, SaaS), utilise kind=\"other\".\n"
         "Ne jamais inventer de catégorie comme service, technology, concept ou tool.\n"
+        "Extraction pédagogique :\n"
+        "- N'extrais une notion que si les pages la définissent ou l'expliquent vraiment "
+        "(pas un simple titre, sommaire ou mention isolée).\n"
+        "- Dans notes, reporte la définition / mécanisme / propriétés utiles tels que le "
+        "cours les expose ; conserve synonymes, acronymes et formulations alternatives "
+        "(ex. « aussi appelé … »).\n"
+        "- pages doit lister toutes les pages de CETTE fenêtre où la notion est expliquée.\n"
+        "- Si la même notion réapparaît sous un autre id déjà vu, renseigne same_as avec "
+        "l'id canonique ; n'invente pas de fusion entre notions proches mais distinctes.\n"
+        "- contradictions : uniquement des oppositions factuelles explicites du cours "
+        "(pas de simples reformulations complémentaires).\n"
         "Règles : n'invente rien ; same_as seulement si la même notion est déjà identifiée ; "
         "ne fusionne pas deux notions proches mais distinctes.\n"
         f"Pages :\n{pages_block}"
@@ -305,16 +316,95 @@ def _merge_into(existing: Concept, incoming: Concept, raw: dict[str, Any]) -> No
     existing.pages = _union_sorted(existing.pages, incoming.pages)
     existing.essential = existing.essential or incoming.essential
     existing.depends_on = _union_preserve(existing.depends_on, incoming.depends_on)
-    if existing.notes and incoming.notes and _normalize_note(existing.notes) != _normalize_note(
-        incoming.notes
+    # Preférer un label plus informatif si l'existant est trop court / générique.
+    if incoming.label and (
+        not existing.label
+        or (
+            len(incoming.label.strip()) > len(existing.label.strip())
+            and _normalize_note(existing.label) in _normalize_note(incoming.label)
+        )
     ):
-        if "CONTRADICTION" not in existing.notes.upper():
-            existing.notes = (
-                f"{existing.notes}\n"
-                f"[CONTRADICTION] Formulation concurrente (non tranchée) : {incoming.notes}"
-            )
-    elif incoming.notes and not existing.notes:
-        existing.notes = incoming.notes
+        existing.label = incoming.label
+    existing.notes = _merge_notes(existing.notes, incoming.notes)
+
+
+def _note_content_lines(notes: str) -> list[str]:
+    """Découpe les notes en lignes utiles (métadonnées LLM seules exclues du merge)."""
+    lines: list[str] = []
+    for raw in (notes or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lines.append(line)
+    return lines
+
+
+def _is_metadata_only_notes(notes: str) -> bool:
+    """True si les notes ne portent que le marqueur de catégorie LLM."""
+    residual = (notes or "").strip()
+    if not residual:
+        return True
+    residual = re.sub(
+        r"\(Catégorie LLM d'origine\s*:[^)]+\)",
+        " ",
+        residual,
+        flags=re.IGNORECASE,
+    )
+    residual = re.sub(
+        r"^Catégorie LLM d'origine\s*:\s*.+$",
+        " ",
+        residual,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    return not residual.strip()
+
+
+def _merge_notes(existing: str, incoming: str) -> str:
+    """Fusionne des notes complémentaires sans inventer de contradiction.
+
+    Les contradictions réelles restent du ressort de `contradictions` / `_apply_contradiction`.
+    """
+    existing = (existing or "").strip()
+    incoming = (incoming or "").strip()
+    if not incoming:
+        return existing
+    if not existing:
+        return incoming
+    # Si l'existant n'est que de la métadonnée, partir du fond pédagogique entrant.
+    if _is_metadata_only_notes(existing) and not _is_metadata_only_notes(incoming):
+        return _merge_notes(incoming, existing)
+    if _normalize_note(existing) == _normalize_note(incoming):
+        return existing
+
+    lines = _note_content_lines(existing)
+    normalized_existing = [_normalize_note(line) for line in lines]
+
+    for line in _note_content_lines(incoming):
+        norm = _normalize_note(line)
+        if not norm:
+            continue
+        if norm in normalized_existing:
+            continue
+        # Sous-chaîne déjà couverte par une ligne plus riche.
+        if any(norm in other and norm != other for other in normalized_existing):
+            continue
+        # Remplacer une ligne plus pauvre déjà présente.
+        replaced = False
+        for index, other in enumerate(normalized_existing):
+            if (
+                other in norm
+                and other != norm
+                and "CONTRADICTION" not in lines[index].upper()
+            ):
+                lines[index] = line
+                normalized_existing[index] = norm
+                replaced = True
+                break
+        if not replaced:
+            lines.append(line)
+            normalized_existing.append(norm)
+
+    return "\n".join(lines)
 
 
 def _resolve_id(concept_id: str, alias_map: dict[str, str]) -> str:

@@ -20,6 +20,12 @@ from src.revision.engine.llm_guard import (
     ensure_prompt_fits,
     max_attempts_per_step,
 )
+from src.revision.engine.near_copy import (
+    full_source_corpus,
+    is_near_copy,
+    page_source_corpus,
+    whitelist_terms,
+)
 from src.revision.engine.models import (
     ChapterDraft,
     ChapterPlan,
@@ -105,12 +111,15 @@ class QualityController:
             raise TypeError("plan doit être un PedagogicalPlan.")
 
         pages = list(source_pages or [])
-        source_text = _source_corpus(course, pages)
+        source_text = full_source_corpus(course, pages)
+        page_source_text = page_source_corpus(course, pages)
         working = document.model_copy(deep=True)
         rewritten: list[int] = []
 
         working = _strip_question_blocks(working)
-        report = self._evaluate(working, course, plan, source_text)
+        report = self._evaluate(
+            working, course, plan, source_text, page_source_text=page_source_text
+        )
         if report.ok:
             return working, report
 
@@ -170,7 +179,9 @@ class QualityController:
             working = _replace_chapter(working, new_draft)
             rewritten.append(chapter_index)
 
-        final = self._evaluate(working, course, plan, source_text)
+        final = self._evaluate(
+            working, course, plan, source_text, page_source_text=page_source_text
+        )
         final = QualityReport(
             ok=final.ok,
             issues=final.issues,
@@ -190,8 +201,11 @@ class QualityController:
         course: CourseModel,
         plan: PedagogicalPlan,
         source_text: str,
+        *,
+        page_source_text: str | None = None,
     ) -> QualityReport:
         issues: list[QualityIssue] = []
+        page_corpus = page_source_text if page_source_text is not None else source_text
 
         if len(document.chapters) != len(plan.chapters):
             issues.append(
@@ -230,6 +244,7 @@ class QualityController:
                     chapter_plan=chapter_plan,
                     course=course,
                     source_text=source_text,
+                    page_source_text=page_corpus,
                 )
             )
 
@@ -336,9 +351,11 @@ def _evaluate_chapter(
     chapter_plan: ChapterPlan | None,
     course: CourseModel,
     source_text: str,
+    page_source_text: str | None = None,
 ) -> list[QualityIssue]:
     issues: list[QualityIssue] = []
     index = draft.index
+    page_corpus = page_source_text if page_source_text is not None else source_text
 
     if not draft.blocks:
         issues.append(
@@ -411,7 +428,7 @@ def _evaluate_chapter(
             )
         )
 
-    whitelist = _whitelist_terms(course)
+    whitelist = whitelist_terms(course)
     concept_notes = " ".join(
         c.notes
         for c in course.concepts
@@ -449,8 +466,8 @@ def _evaluate_chapter(
                         chapter_index=index,
                     )
                 )
-            if isinstance(block, ParagraphBlock) and _is_near_copy(
-                text, source_text, whitelist=whitelist
+            if isinstance(block, ParagraphBlock) and is_near_copy(
+                text, page_corpus, whitelist=whitelist
             ):
                 issues.append(
                     QualityIssue(
@@ -527,63 +544,6 @@ def _has_excessive_repetition(texts: list[str]) -> bool:
         if similar >= 3:
             return True
     return False
-
-
-def _is_near_copy(text: str, source_text: str, *, whitelist: set[str]) -> bool:
-    raw = _normalize(text)
-    source_norm = _normalize(source_text)
-    # Copie longue quasi intégrale du source (avant retrait du jargon).
-    if len(raw) >= 40 and raw in source_norm:
-        return True
-
-    # Après retrait du jargon : encore un long passage recopié.
-    cleaned = _normalize(_strip_whitelist(text, whitelist))
-    source_clean = _normalize(_strip_whitelist(source_text, whitelist))
-    if len(cleaned) < 40:
-        return False
-    if cleaned in source_clean:
-        return True
-    words = cleaned.split()
-    if len(words) < 8:
-        return False
-    window = 8
-    for start in range(0, len(words) - window + 1):
-        chunk = " ".join(words[start : start + window])
-        if len(chunk) >= 40 and chunk in source_clean:
-            return True
-    return False
-
-
-def _strip_whitelist(text: str, whitelist: set[str]) -> str:
-    result = text
-    # Retirer d'abord les termes longs pour éviter les fragments.
-    for term in sorted(whitelist, key=len, reverse=True):
-        if not term:
-            continue
-        pattern = re.compile(re.escape(term), re.IGNORECASE)
-        result = pattern.sub(" ", result)
-    return result
-
-
-def _whitelist_terms(course: CourseModel) -> set[str]:
-    """Jargon autorisé : labels et symboles courts — pas les phrases sources entières."""
-    terms: set[str] = set()
-    for concept in course.concepts:
-        label = concept.label.strip()
-        if label:
-            terms.add(label)
-        for line in concept.notes.splitlines():
-            line = line.strip()
-            if not line or "CONTRADICTION" in line.upper():
-                continue
-            # Uniquement des fragments courts (symboles / formules), pas une phrase complète.
-            if len(line) <= 40:
-                terms.add(line)
-            for match in _NUMBER_RE.finditer(line):
-                terms.add(match.group(0))
-            for token in re.findall(r"\b[A-Za-z]\s*=\s*\d+\b", line):
-                terms.add(token)
-    return terms
 
 
 def _planned_essential_ids(course: CourseModel, plan: PedagogicalPlan) -> list[str]:
@@ -673,6 +633,7 @@ def _build_rewrite_prompt(
         "Corrige les défauts listés. Ne copie pas le PDF. N'invente rien.\n"
         "Conserve tous les concepts prévus (essentiels et secondaires), les exemples, "
         "formules, tableaux et références de pages déjà présents.\n"
+        "Chaque concept prévu doit rester réellement expliqué (pas une simple mention).\n"
         "N'appauvris pas les explications : la couverture réelle doit rester au moins "
         "équivalente au chapitre d'origine.\n"
         "Si une CONTRADICTION est présente, signale-la sans la résoudre.\n"
@@ -730,11 +691,8 @@ def _load_json_object(raw: str) -> dict[str, Any]:
 
 
 def _source_corpus(course: CourseModel, pages: list[CoursePage]) -> str:
-    parts = [page.text for page in pages]
-    parts.extend(unit.text for unit in course.units)
-    parts.extend(concept.notes for concept in course.concepts if concept.notes)
-    parts.extend(concept.label for concept in course.concepts)
-    return "\n".join(parts)
+    """Compatibilité : corpus large (pages + notes + labels)."""
+    return full_source_corpus(course, pages)
 
 
 def _block_text(block: object) -> str:
