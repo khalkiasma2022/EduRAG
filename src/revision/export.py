@@ -1,14 +1,11 @@
 """Exporte une fiche de révision enregistrée en Markdown ou en PDF.
 
 Le contenu généré est recopié dans son ordre logique.
-Le PDF embarque Noto Naskh Arabic et façonne l'arabe avec HarfBuzz.
+Le PDF utilise ProfessionalPDFBuilder (palette EduRAG, couverture, callouts).
 """
 
 import re
 from pathlib import Path
-
-from fpdf import FPDF
-from fpdf.fonts import FontFace
 
 _LANGUAGES = frozenset({"fr", "en", "ar"})
 _LEVELS = frozenset({"beginner", "intermediate", "advanced"})
@@ -21,13 +18,6 @@ _LEVEL_LABELS = {
     "advanced": "Avancé",
 }
 _TYPE_LABELS = {"short": "Fiche courte", "complete": "Fiche complète"}
-_FONT_PATH = Path(__file__).resolve().parents[2] / "assets" / "fonts" / "NotoNaskhArabic-Regular.ttf"
-_FONT_FAMILY = "NotoNaskhArabic"
-_TEXT_DIRECTIONS = {
-    "fr": {"direction": "ltr", "script": "latn", "language": "fra", "align": "L"},
-    "en": {"direction": "ltr", "script": "latn", "language": "eng", "align": "L"},
-    "ar": {"direction": "rtl", "script": "arab", "language": "ara", "align": "R"},
-}
 _HEADING = re.compile(r"^(#{1,3})\s+(\S.*)$")
 _BULLET = re.compile(r"^\s*[-*]\s+(\S.*)$")
 _NUMBERED = re.compile(r"^\s*(\d+[.)])\s+(\S.*)$")
@@ -66,11 +56,26 @@ class RevisionExport:
         return path
 
     def export_pdf(self, sheet: object, output_path: str | Path) -> Path:
-        """Écrit la fiche dans un PDF et renvoie le chemin du fichier créé."""
+        """Écrit la fiche dans un PDF stylé et renvoie le chemin du fichier créé."""
         fields = _validate_sheet(sheet)
         path = _check_output_path(output_path, suffix=".pdf")
         path.parent.mkdir(parents=True, exist_ok=True)
-        _write_pdf(fields, path)
+        # Import local : évite un cycle éventuel export ↔ engine au chargement.
+        from src.revision.engine.pdf_builder import ProfessionalPDFBuilder
+
+        ProfessionalPDFBuilder().build_from_markdown(
+            str(fields["content"]),
+            path,
+            meta={
+                "filename": fields["filename"],
+                "page_start": fields["page_start"],
+                "page_end": fields["page_end"],
+                "language": fields["language"],
+                "level": fields["level"],
+                "sheet_type": fields["sheet_type"],
+                "created_at": fields["created_at"],
+            },
+        )
         return path
 
 
@@ -171,96 +176,8 @@ def _check_output_path(output_path: object, suffix: str = ".md") -> Path:
     return path
 
 
-def _write_pdf(fields: dict[str, str | int], path: Path) -> None:
-    """Dessine la fiche. Le texte n'est jamais renversé à la main."""
-    if not _FONT_PATH.is_file():
-        raise RuntimeError("La police Noto Naskh Arabic est introuvable.")
-
-    direction = _TEXT_DIRECTIONS[str(fields["language"])]
-    align = str(direction["align"])
-    pdf = FPDF(format="A4")
-    pdf.set_auto_page_break(auto=True, margin=18)
-    pdf.add_page()
-    pdf.add_font(_FONT_FAMILY, fname=str(_FONT_PATH))
-    pdf.set_font(_FONT_FAMILY, size=18)
-    pdf.set_text_shaping(
-        use_shaping_engine=True,
-        direction=str(direction["direction"]),
-        script=str(direction["script"]),
-        language=str(direction["language"]),
-    )
-    _write_line(pdf, "Fiche de révision", align)
-    pdf.ln(2)
-    pdf.set_font(_FONT_FAMILY, size=11)
-    for line in _metadata_lines(fields):
-        _write_line(pdf, line, align)
-    pdf.ln(4)
-    pdf.set_font(_FONT_FAMILY, size=12)
-    for block in _content_blocks(str(fields["content"])):
-        _write_block(pdf, block, align)
-    pdf.output(str(path))
-
-
-def _metadata_lines(fields: dict[str, str | int]) -> list[str]:
-    """Reprend les informations affichées dans l'export Markdown."""
-    return [
-        f"Cours : {fields['filename']}",
-        f"Pages : {_format_pages(int(fields['page_start']), int(fields['page_end']))}",
-        f"Langue : {_LANGUAGE_LABELS[str(fields['language'])]}",
-        f"Niveau : {_LEVEL_LABELS[str(fields['level'])]}",
-        f"Type : {_TYPE_LABELS[str(fields['sheet_type'])]}",
-        f"Date de création : {fields['created_at']}",
-    ]
-
-
-def _write_line(pdf: FPDF, text: str, align: str, size: int | None = None) -> None:
-    """Écrit un paragraphe qui passe à la ligne, puis à la page suivante si besoin."""
-    if size is not None:
-        pdf.set_font(_FONT_FAMILY, size=size)
-    pdf.multi_cell(0, text=text, align=align, new_x="LMARGIN", new_y="NEXT")
-    if size is not None:
-        pdf.set_font(_FONT_FAMILY, size=12)
-
-
-def _write_block(pdf: FPDF, block: tuple, align: str) -> None:
-    """Écrit un titre, un paragraphe, une puce, une entrée numérotée ou un tableau."""
-    kind = block[0]
-    if kind == "heading":
-        size = {1: 16, 2: 14, 3: 13}[block[1]]
-        _write_line(pdf, str(block[2]), align, size=size)
-        pdf.ln(1)
-        return
-    if kind == "item":
-        _write_line(pdf, f"• {block[1]}", align)
-        return
-    if kind == "numbered":
-        _write_line(pdf, f"{block[1]} {block[2]}", align)
-        return
-    if kind == "table":
-        _write_table(pdf, block[1], align)
-        pdf.ln(2)
-        return
-    _write_line(pdf, str(block[1]), align)
-    pdf.ln(1)
-
-
-def _write_table(pdf: FPDF, rows: list[list[str]], align: str) -> None:
-    """Dessine un tableau simple, y compris lorsqu'il change de page."""
-    width = max(len(row) for row in rows)
-    with pdf.table(
-        text_align=align,
-        width=pdf.epw,
-        first_row_as_headings=True,
-        headings_style=FontFace(emphasis=""),
-        line_height=7,
-    ) as table:
-        for row in rows:
-            cells = row + [""] * (width - len(row))
-            table.row(cells)
-
-
 def _content_blocks(content: str) -> list[tuple]:
-    """Découpe le Markdown simple produit pour une fiche."""
+    """Découpe le Markdown simple produit pour une fiche (tests / utilitaires)."""
     blocks: list[tuple] = []
     table_rows: list[list[str]] = []
 

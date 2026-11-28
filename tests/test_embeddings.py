@@ -37,7 +37,7 @@ def embedding_model(fake_encoder: MagicMock):
         patch("src.retrieval.embeddings.SentenceTransformer", return_value=fake_encoder) as constructor,
         patch("src.retrieval.embeddings.torch.cuda.is_available", return_value=False),
     ):
-        model = EmbeddingModel()
+        model = EmbeddingModel(device="cpu")
     return model, constructor, fake_encoder
 
 
@@ -52,6 +52,15 @@ def test_load_model(embedding_model) -> None:
     assert model.model is fake_encoder
     assert model.device == "cpu"
     assert model.dimension == 4
+
+
+def test_default_without_gpu_raises(fake_encoder: MagicMock) -> None:
+    with (
+        patch("src.retrieval.embeddings.SentenceTransformer", return_value=fake_encoder),
+        patch("src.retrieval.embeddings.torch.cuda.is_available", return_value=False),
+    ):
+        with pytest.raises(RuntimeError, match="CUDA est requis"):
+            EmbeddingModel()
 
 
 def test_embed_query_returns_vector(embedding_model) -> None:

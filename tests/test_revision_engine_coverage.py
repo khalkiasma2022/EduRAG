@@ -193,14 +193,16 @@ def test_all_ids_present_but_empty_text_is_rejected() -> None:
             {"type": "definition", "text": "", "source_pages": [1]},
         ],
     )
-    with pytest.raises(ValueError, match="Couverture|expliqué|qualité"):
+    # Le hard-fail de couverture est désactivé ; le chapitre vide reste refusé
+    # via missing_explanation (contenu pédagogique insuffisant).
+    with pytest.raises(ValueError, match="explication|qualité"):
         QualityController(
             ScriptedLLM([still_empty] * max_attempts_per_step()),
             LlmBudgetGuard(),
         ).review(document, course, plan, source_pages=_pages())
 
 
-def test_secondary_declared_but_unexplained_is_rejected() -> None:
+def test_secondary_declared_but_unexplained_is_accepted_without_coverage_gate() -> None:
     document = _document(
         concept_ids=["c_iaas", "c_hyp"],
         blocks=[
@@ -229,34 +231,28 @@ def test_secondary_declared_but_unexplained_is_rejected() -> None:
     )
     assert [c.id for c in unexplained] == ["c_hyp"]
     assert unexplained[0].essential is False
-    still_missing_secondary = _chapter_json(
-        concept_ids=["c_iaas", "c_hyp"],
-        blocks=[
-            {
-                "type": "paragraph",
-                "text": (
-                    "IaaS, ou Infrastructure as a Service, fournit des ressources "
-                    "virtualisées à la demande pour les équipes techniques."
-                ),
-                "source_pages": [1],
-            },
-            {
-                "type": "definition",
-                "text": "Infrastructure as a Service. Fournit des ressources virtualisées.",
-                "source_pages": [1],
-            },
-            {
-                "type": "synthesis",
-                "text": "Retenir le rôle d'IaaS dans le cloud public.",
-                "source_pages": [1],
-            },
-        ],
+    reviewed, report = QualityController(ScriptedLLM(), LlmBudgetGuard()).review(
+        document, course, plan, source_pages=_pages()
     )
-    with pytest.raises(ValueError, match="secondaires non expliqués|c_hyp|qualité"):
-        QualityController(
-            ScriptedLLM([still_missing_secondary] * max_attempts_per_step()),
-            LlmBudgetGuard(),
-        ).review(document, course, plan, source_pages=_pages())
+    assert report.ok is True
+    assert not any(issue.code == "unexplained_concept" for issue in report.issues)
+    assert reviewed.chapters[0].concept_ids_covered == ["c_iaas", "c_hyp"]
+
+
+def test_typo_and_accent_variants_count_as_coverage() -> None:
+    concept = Concept(
+        id="3",
+        label="Adress Internet",
+        kind="other",
+        pages=[1],
+        essential=False,
+        notes="Adresse utilisée pour localiser une ressource sur le réseau.",
+    )
+    corpus = (
+        "L'adresse Internet permet d'identifier une ressource sur le réseau mondial ; "
+        "elle oriente le navigateur vers le bon serveur."
+    )
+    assert concept_is_explained(concept, corpus) is True
 
 
 def test_relevant_definition_is_accepted() -> None:
@@ -395,7 +391,8 @@ def test_rewrite_keeping_ids_but_removing_explanation_fails() -> None:
             },
         ],
     )
-    with pytest.raises(ValueError, match="Couverture|expliqué|qualité"):
+    # Toujours refusé via anti-appauvrissement de réécriture (pas le gate couverture).
+    with pytest.raises(ValueError, match="appauvrie|qualité"):
         QualityController(
             ScriptedLLM([bad_rewrite] * max_attempts_per_step()),
             LlmBudgetGuard(),
@@ -441,10 +438,10 @@ def test_complete_document_accepted_without_false_reject() -> None:
     assert reviewed.chapters[0].concept_ids_covered == ["c_iaas", "c_hyp", "c_energy"]
 
 
-def test_generator_rejects_declared_ids_without_real_explanation() -> None:
+def test_generator_allows_declared_ids_without_real_explanation() -> None:
     course = _course_with_secondary()
     plan = _plan_single(["c_iaas"])
-    bad = _chapter_json(
+    vague = _chapter_json(
         concept_ids=["c_iaas"],
         blocks=[
             {
@@ -459,15 +456,16 @@ def test_generator_rejects_declared_ids_without_real_explanation() -> None:
             },
         ],
     )
-    llm = ScriptedLLM([bad])
+    llm = ScriptedLLM([vague])
     llm.tokenizer = _FakeTokenizer()
     llm.model = _FakeModel()
-    with pytest.raises(ValueError, match="Couverture|expliqué"):
-        OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
-            course,
-            plan,
-            filename="cours.pdf",
-            page_start=1,
-            page_end=1,
-            source_pages=_pages(),
-        )
+    document = OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
+        course,
+        plan,
+        filename="cours.pdf",
+        page_start=1,
+        page_end=1,
+        source_pages=_pages(),
+    )
+    assert document.chapters[0].concept_ids_covered == ["c_iaas"]
+    assert llm.calls == 1

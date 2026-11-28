@@ -1,7 +1,7 @@
 """Transformation des chunks et des questions en vecteurs.
 
-Le modèle est chargé une seule fois, sur GPU si CUDA est disponible,
-sinon sur CPU.
+Le modèle est chargé une seule fois sur GPU CUDA.
+device='cpu' reste autorisé uniquement pour les tests unitaires.
 """
 
 import numpy as np
@@ -15,13 +15,17 @@ DEFAULT_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v
 class EmbeddingModel:
     """Calcule les embeddings des morceaux de cours et des questions."""
 
-    def __init__(self, model_name: str = DEFAULT_MODEL_NAME) -> None:
-        """Charge le modèle une fois et choisit le processeur disponible."""
+    def __init__(
+        self,
+        model_name: str = DEFAULT_MODEL_NAME,
+        device: str | None = None,
+    ) -> None:
+        """Charge le modèle une fois sur CUDA (sauf device explicite pour les tests)."""
         if not isinstance(model_name, str) or model_name.strip() == "":
             raise ValueError("Le nom du modèle ne peut pas être vide.")
 
         self.model_name = model_name
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = _select_device(device)
         # Le modèle reste en mémoire : les appels suivants ne le rechargent pas.
         self.model = SentenceTransformer(self.model_name, device=self.device)
 
@@ -71,6 +75,20 @@ class EmbeddingModel:
         expected = self.dimension
         if any(len(vector) != expected for vector in vectors):
             raise ValueError("Les vecteurs n'ont pas tous la dimension du modèle.")
+
+
+def _select_device(device: str | None) -> str:
+    """Exige CUDA par défaut. device='cpu' reste autorisé pour les tests unitaires."""
+    if device is None:
+        device = "cuda"
+    if not isinstance(device, str) or device not in {"cpu", "cuda"}:
+        raise ValueError("Le processeur demandé doit être 'cpu' ou 'cuda'.")
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA est requis pour EduRAG, mais aucun GPU n'est disponible. "
+            "Installez un PyTorch CUDA (pas le build CPU)."
+        )
+    return device
 
 
 def _chunk_texts(chunks: object) -> list[str]:

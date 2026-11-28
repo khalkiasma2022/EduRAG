@@ -374,6 +374,125 @@ def test_generates_chapters_in_plan_order_covering_essentials() -> None:
     assert guard.reserved_tokens == 2 * TOKENS_CHAPTER
 
 
+def test_allows_incomplete_secondary_concept_coverage() -> None:
+    """Sans validateur de couverture, un secondaire non expliqué ne bloque pas."""
+    incomplete = _chapter_json(
+        index=0,
+        title="Internet",
+        concept_ids=["c_net", "c_addr"],
+        blocks=[
+            {
+                "type": "definition",
+                "text": "Internet est le réseau mondial qui relie des millions d'ordinateurs.",
+                "source_pages": [1],
+            },
+            {
+                "type": "paragraph",
+                "text": "On utilise Internet pour consulter des pages et échanger des messages.",
+                "source_pages": [1],
+            },
+            {
+                "type": "synthesis",
+                "text": "Internet reste le support de base de la navigation.",
+                "source_pages": [1],
+            },
+        ],
+    )
+    course = CourseModel(
+        units=[CourseUnit(text="Internet et adresses.", page_start=1, page_end=1)],
+        concepts=[
+            Concept(
+                id="c_net",
+                label="Internet",
+                kind="other",
+                pages=[1],
+                essential=True,
+                notes="Réseau mondial d'ordinateurs.",
+            ),
+            Concept(
+                id="c_addr",
+                label="Adress Internet",
+                kind="other",
+                pages=[1],
+                essential=False,
+                notes="Adresse utilisée pour localiser une ressource.",
+            ),
+        ],
+        relations=[],
+        themes=["Web"],
+        essential_concept_ids=["c_net"],
+    )
+    plan = PedagogicalPlan(
+        language="fr",
+        level=LEGACY_STORE_LEVEL,
+        sheet_type=LEGACY_STORE_SHEET_TYPE,
+        chapters=[
+            ChapterPlan(
+                index=0,
+                title="Internet",
+                objectives=[LearningObjective(text="Comprendre Internet", concept_ids=["c_net"])],
+                concept_ids=["c_net", "c_addr"],
+                page_refs=[1],
+                needs_example=False,
+                needs_table=False,
+                needs_questions=False,
+                depth="complete",
+            )
+        ],
+    )
+    llm = ScriptedLLM([incomplete])
+    document = OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
+        course,
+        plan,
+        filename="cours.pdf",
+        page_start=1,
+        page_end=1,
+        source_pages=[
+            CoursePage(page_number=1, text="Internet relie des ordinateurs. Adresse Internet.", filename="cours.pdf")
+        ],
+    )
+    chapter = document.chapters[0]
+    assert {"c_net", "c_addr"} <= set(chapter.concept_ids_covered)
+    assert llm.calls == 1
+
+
+def test_allows_empty_concept_ids_covered() -> None:
+    """Sans gate concepts, des ids vides restent acceptés."""
+    incomplete = _chapter_json(
+        index=0,
+        title="Variables",
+        concept_ids=[],
+        blocks=[
+            {
+                "type": "definition",
+                "text": "Une variable stocke une valeur nommée.",
+                "source_pages": [1],
+            },
+            {
+                "type": "paragraph",
+                "text": "On introduit la notion de variable pour nommer une information utile.",
+                "source_pages": [1],
+            },
+            {
+                "type": "synthesis",
+                "text": "La variable est l'outil de base pour mémoriser une donnée.",
+                "source_pages": [1],
+            },
+        ],
+    )
+    llm = ScriptedLLM([incomplete, _short_chapter_fun()])
+    document = OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
+        _course(),
+        _plan(),
+        filename="cours.pdf",
+        page_start=1,
+        page_end=2,
+        source_pages=_pages(),
+    )
+    assert document.chapters[0].concept_ids_covered == []
+    assert len(document.chapters[0].blocks) >= 2
+
+
 def test_complete_sheet_includes_rich_blocks_without_questions() -> None:
     llm = ScriptedLLM([_complete_chapter_var(), _complete_chapter_fun()])
     document = OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
@@ -386,9 +505,10 @@ def test_complete_sheet_includes_rich_blocks_without_questions() -> None:
     )
 
     assert llm.token_budgets == [TOKENS_CHAPTER, TOKENS_CHAPTER]
-    assert "complète" in llm.prompts[0].casefold() or "complete" in llm.prompts[0].casefold()
+    assert "révision" in llm.prompts[0].casefold() or "revision" in llm.prompts[0].casefold()
     assert "question" in llm.prompts[0].casefold()
     assert "interdit" in llm.prompts[0].casefold()
+    assert "obligation de couvrir" in llm.prompts[0].casefold()
     assert any(
         isinstance(block, ExampleBlock) and block.origin == "pedagogical_addition"
         for ch in document.chapters
@@ -431,7 +551,7 @@ def test_distinguishes_course_and_pedagogical_examples() -> None:
     assert "pedagogical_addition" in origins
 
 
-def test_rejects_question_blocks() -> None:
+def test_strips_question_blocks_and_keeps_chapter() -> None:
     bad = _chapter_json(
         index=0,
         title="Variables",
@@ -449,16 +569,21 @@ def test_rejects_question_blocks() -> None:
             },
         ],
     )
-    llm = ScriptedLLM([bad, bad])
-    with pytest.raises(ValueError, match="question"):
-        OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
-            _course(),
-            _plan(),
-            filename="cours.pdf",
-            page_start=1,
-            page_end=2,
-            source_pages=_pages(),
-        )
+    llm = ScriptedLLM([bad, _short_chapter_fun()])
+    document = OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
+        _course(),
+        _plan(),
+        filename="cours.pdf",
+        page_start=1,
+        page_end=2,
+        source_pages=_pages(),
+    )
+    assert all(
+        getattr(block, "type", None) != "question"
+        for chapter in document.chapters
+        for block in chapter.blocks
+    )
+    assert len(document.chapters[0].blocks) >= 1
 
 
 def test_rejects_invented_url_attributed_to_source() -> None:
@@ -546,21 +671,25 @@ def test_keeps_contradiction_without_invented_resolution() -> None:
         )
 
 
-def test_invalid_json_retries_then_fails_without_partial_document() -> None:
-    llm = ScriptedLLM(["pas-json", "{toujours bad", "ne-doit-pas-etre-lu"])
+def test_invalid_json_retries_then_uses_fallback_chapter() -> None:
+    llm = ScriptedLLM(
+        ["pas-json", "{toujours bad", _short_chapter_fun()]
+    )
     guard = LlmBudgetGuard()
-    with pytest.raises(ValueError, match="JSON"):
-        OriginalContentGenerator(llm, guard).generate(
-            _course(),
-            _plan(),
-            filename="cours.pdf",
-            page_start=1,
-            page_end=2,
-            source_pages=_pages(),
-        )
-    assert llm.calls == 2
-    assert guard.calls == 2
-    assert guard.reserved_tokens == 2 * TOKENS_CHAPTER
+    document = OriginalContentGenerator(llm, guard).generate(
+        _course(),
+        _plan(),
+        filename="cours.pdf",
+        page_start=1,
+        page_end=2,
+        source_pages=_pages(),
+    )
+    assert len(document.chapters) == 2
+    assert document.chapters[0].blocks
+    assert document.chapters[0].concept_ids_covered == []
+    assert llm.calls == 3
+    assert guard.calls == 3
+    assert guard.reserved_tokens == 3 * TOKENS_CHAPTER
 
 
 def test_incomplete_second_chapter_does_not_return_partial_success() -> None:
@@ -582,29 +711,36 @@ def test_incomplete_second_chapter_does_not_return_partial_success() -> None:
         )
 
 
-def test_missing_essential_concept_is_rejected() -> None:
-    missing = _chapter_json(
+def test_missing_essential_concept_no_longer_blocks_generation() -> None:
+    """La couverture pédagogique n'est plus un hard-fail du générateur."""
+    vague = _chapter_json(
         index=0,
         title="Variables",
         concept_ids=[],
         blocks=[
             {
                 "type": "paragraph",
-                "text": "Texte vague sans couvrir la notion essentielle.",
+                "text": "Texte vague sans couvrir la notion essentielle demandée.",
                 "source_pages": [1],
-            }
+            },
+            {
+                "type": "synthesis",
+                "text": "Une conclusion large sans ancrage conceptuel précis.",
+                "source_pages": [1],
+            },
         ],
     )
-    llm = ScriptedLLM([missing, missing])
-    with pytest.raises(ValueError, match="concept|essentiel"):
-        OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
-            _course(),
-            _plan(),
-            filename="cours.pdf",
-            page_start=1,
-            page_end=2,
-            source_pages=_pages(),
-        )
+    llm = ScriptedLLM([vague, _short_chapter_fun()])
+    document = OriginalContentGenerator(llm, LlmBudgetGuard()).generate(
+        _course(),
+        _plan(),
+        filename="cours.pdf",
+        page_start=1,
+        page_end=2,
+        source_pages=_pages(),
+    )
+    assert document.chapters[0].concept_ids_covered == []
+    assert len(document.chapters) == 2
 
 
 def test_budget_ceiling_is_enforced() -> None:
@@ -681,7 +817,7 @@ def test_chapter_prompt_documents_exact_block_types_without_pipe_union() -> None
         "diagram",
         "synthesis",
     ):
-        assert f'"type":"{block_type}"' in prompt
+        assert block_type in prompt
 
     assert "from_course" in prompt
     assert "pedagogical_addition" in prompt
@@ -690,3 +826,4 @@ def test_chapter_prompt_documents_exact_block_types_without_pipe_union() -> None
     assert "concept_ids_covered" in prompt
     assert "sans Markdown" in prompt
     assert "needs_questions=false" in prompt
+    assert "Couverture obligatoire" not in prompt

@@ -24,9 +24,9 @@ def test_step_budget_constants_match_guaranteed_envelope() -> None:
     assert llm_guard.MAX_CHAPTERS == 10
     assert llm_guard.MAX_CHAPTERS_SHORT == llm_guard.MAX_CHAPTERS
     assert llm_guard.MAX_CHAPTERS_COMPLETE == llm_guard.MAX_CHAPTERS
-    assert llm_guard.TOKENS_UNDERSTANDING == 384
+    assert llm_guard.TOKENS_UNDERSTANDING == 1024
     assert llm_guard.TOKENS_PLAN == 512
-    assert llm_guard.TOKENS_CHAPTER == 640
+    assert llm_guard.TOKENS_CHAPTER == 768
     assert llm_guard.TOKENS_CHAPTER_SHORT == llm_guard.TOKENS_CHAPTER
     assert llm_guard.TOKENS_CHAPTER_COMPLETE == llm_guard.TOKENS_CHAPTER
     assert llm_guard.TOKENS_REWRITE == 384
@@ -34,10 +34,10 @@ def test_step_budget_constants_match_guaranteed_envelope() -> None:
     assert max_attempts_per_step() == 2
     assert llm_guard.MAX_REWRITE_CHAPTERS == 2
     assert llm_guard.MAX_CONCEPTS_PER_CHAPTER == 4
-    assert llm_guard.MIN_TOKENS_PER_CONCEPT == 160
+    assert llm_guard.MIN_TOKENS_PER_CONCEPT == 192
     assert llm_guard.MAX_COURSE_CONCEPTS == 40
     assert llm_guard.MAX_LLM_CALLS == 48
-    assert llm_guard.MAX_TOTAL_NEW_TOKENS == 24000
+    assert llm_guard.MAX_TOTAL_NEW_TOKENS == 39000
     assert llm_guard.MAX_COURSE_TOKENS_PER_WINDOW == 1800
     assert llm_guard.LEGACY_STORE_LEVEL == "intermediate"
     assert llm_guard.LEGACY_STORE_SHEET_TYPE == "complete"
@@ -54,9 +54,9 @@ def test_guaranteed_worst_case_pipeline_fits_global_caps() -> None:
         llm_guard.MAX_CHAPTERS,
     )
     nominal = pipeline_token_cost_nominal(10, 10)
-    assert nominal == 10 * 384 + 512 + 10 * 640 + 2 * 384  # 11520
+    assert nominal == 10 * 1024 + 512 + 10 * 768 + 2 * 384  # 19200
     assert tokens == 2 * nominal
-    assert tokens == 23040
+    assert tokens == 38400
     assert tokens <= llm_guard.MAX_TOTAL_NEW_TOKENS
     assert pipeline_call_cost_nominal(10, 10) == 23  # 10+1+10+2
     assert calls == 46
@@ -78,6 +78,20 @@ def test_ensure_pipeline_capacity_refuses_too_many_windows() -> None:
             windows=llm_guard.MAX_ANALYSIS_WINDOWS + 1,
             chapters=llm_guard.MAX_CHAPTERS,
         )
+
+
+def test_ensure_pipeline_capacity_skip_understanding_ignores_window_cap() -> None:
+    too_many = llm_guard.MAX_ANALYSIS_WINDOWS + 5
+    with pytest.raises(ValueError, match="capacité|fenêtres"):
+        ensure_pipeline_capacity(windows=too_many, chapters=3)
+    ensure_pipeline_capacity(
+        windows=too_many,
+        chapters=3,
+        skip_understanding=True,
+    )
+    full = pipeline_token_cost(too_many, 3)
+    skipped = pipeline_token_cost(0, 3)
+    assert skipped < full
 
 
 def test_ensure_generation_capacity_includes_rewrite_and_retry_reserve() -> None:
@@ -118,7 +132,7 @@ def test_reserve_accepts_worst_case_full_pipeline() -> None:
     for tokens in step_budgets:
         guard.reserve(tokens)
     assert guard.calls == len(step_budgets) == 46
-    assert guard.reserved_tokens == 23040
+    assert guard.reserved_tokens == 38400
 
 
 def test_understanding_retry_consumes_two_reservations() -> None:
@@ -238,9 +252,8 @@ def test_reserve_rejects_above_global_token_cap() -> None:
 
 def test_reserve_rejects_when_sum_would_exceed_global_cap() -> None:
     guard = LlmBudgetGuard()
-    for _ in range(11):
-        guard.reserve(2048)  # 11×2048 = 22528
-    guard.reserve(472)  # 23000
+    for _ in range(19):
+        guard.reserve(2048)  # 19×2048 = 38912
     with pytest.raises(ValueError, match="tokens"):
         guard.reserve(1500)
 

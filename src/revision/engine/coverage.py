@@ -9,6 +9,7 @@ ou contenu propre à son `kind`).
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Iterable
 
 from src.revision.engine.models import (
@@ -378,7 +379,12 @@ def _whole_term_present(term: str, corpus: str, normalized_corpus: str) -> bool:
     if not normalized_term:
         return False
     if " " in normalized_term or len(normalized_term) >= 8:
-        return normalized_term in normalized_corpus
+        if normalized_term in normalized_corpus:
+            return True
+        # Libellés multi-mots : chaque token significatif doit matcher (typos inclus).
+        if " " in normalized_term and _fuzzy_phrase_present(normalized_term, normalized_corpus):
+            return True
+        return False
     pattern = re.compile(
         rf"(?<!\w){re.escape(term.strip())}(?!\w)",
         re.IGNORECASE | re.UNICODE,
@@ -387,7 +393,9 @@ def _whole_term_present(term: str, corpus: str, normalized_corpus: str) -> bool:
         return True
     # Variante normalisée (accents / casse) sur tokens.
     tokens = set(_WORD_SPLIT.split(normalized_corpus))
-    return normalized_term in tokens
+    if normalized_term in tokens:
+        return True
+    return any(_tokens_fuzzy_equal(normalized_term, token) for token in tokens if token)
 
 
 def _has_local_explanation(term: str, corpus: str) -> bool:
@@ -438,7 +446,59 @@ def _kind_evidence_ok(
 
 
 def _normalize(text: str) -> str:
-    return " ".join(text.casefold().split())
+    """Normalise casse, espaces et accents (adress ≈ adresse)."""
+    decomposed = unicodedata.normalize("NFKD", text.casefold())
+    without_marks = "".join(
+        char for char in decomposed if not unicodedata.combining(char)
+    )
+    return " ".join(without_marks.split())
+
+
+def _fuzzy_phrase_present(normalized_phrase: str, normalized_corpus: str) -> bool:
+    tokens = [token for token in _WORD_SPLIT.split(normalized_phrase) if token]
+    if not tokens:
+        return False
+    corpus_tokens = [token for token in _WORD_SPLIT.split(normalized_corpus) if token]
+    if not corpus_tokens:
+        return False
+    for token in tokens:
+        if len(token) <= 2:
+            continue
+        if not any(_tokens_fuzzy_equal(token, other) for other in corpus_tokens):
+            return False
+    return True
+
+
+def _tokens_fuzzy_equal(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if len(left) >= 4 and len(right) >= 4:
+        if left.startswith(right) or right.startswith(left):
+            return True
+        if abs(len(left) - len(right)) <= 1 and _edit_distance_at_most_one(left, right):
+            return True
+    return False
+
+
+def _edit_distance_at_most_one(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > 1:
+        return False
+    if len(left) == len(right):
+        return sum(a != b for a, b in zip(left, right)) <= 1
+    # insertion / deletion d'une lettre
+    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+    index_short = 0
+    mismatches = 0
+    for char in longer:
+        if index_short < len(shorter) and shorter[index_short] == char:
+            index_short += 1
+        else:
+            mismatches += 1
+            if mismatches > 1:
+                return False
+    return True
 
 
 def _unique_preserve(values: Iterable[str]) -> list[str]:

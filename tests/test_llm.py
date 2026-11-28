@@ -91,19 +91,16 @@ def test_model_is_not_reloaded(llm_parts) -> None:
     assert model_cls.from_pretrained.call_count == 1
 
 
-def test_cpu_is_selected_without_gpu() -> None:
+def test_default_without_gpu_raises() -> None:
     with (
         patch("src.generation.llm.AutoTokenizer") as tokenizer_cls,
         patch("src.generation.llm.AutoModelForCausalLM") as model_cls,
         patch("src.generation.llm.torch.cuda.is_available", return_value=False),
     ):
         tokenizer_cls.from_pretrained.return_value = _fake_tokenizer()
-        model = _fake_model()
-        model_cls.from_pretrained.return_value = model
-        language_model = LLM(model_name=MODEL_NAME)
-
-    assert language_model.device == "cpu"
-    assert model_cls.from_pretrained.call_args.kwargs["dtype"] == torch.float32
+        model_cls.from_pretrained.return_value = _fake_model()
+        with pytest.raises(RuntimeError, match="CUDA est requis"):
+            LLM(model_name=MODEL_NAME)
 
 
 def test_gpu_is_selected_when_available() -> None:

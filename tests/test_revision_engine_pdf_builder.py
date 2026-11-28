@@ -22,6 +22,8 @@ from src.revision.engine.models import (
 from src.revision.engine.pdf_builder import (
     AR_FONT_FAMILY,
     AR_FONT_PATH,
+    COLOR_INK,
+    COLOR_MUTED,
     COLOR_SLATE,
     COLOR_TEAL,
     ProfessionalPDFBuilder,
@@ -69,8 +71,10 @@ def _pdf_text(path: Path) -> str:
 
 
 def test_palette_and_arabic_font_resources() -> None:
-    assert COLOR_SLATE == (47, 62, 70)
-    assert COLOR_TEAL == (13, 148, 136)
+    assert COLOR_SLATE == (31, 51, 64)
+    assert COLOR_TEAL == (15, 118, 110)
+    assert COLOR_INK == (30, 41, 59)
+    assert COLOR_MUTED == (100, 116, 139)
     assert AR_FONT_PATH.is_file()
     assert AR_FONT_FAMILY == "NotoNaskhArabic"
 
@@ -98,6 +102,9 @@ def test_build_pdf_from_markdown_without_ir(tmp_path: Path) -> None:
     assert written.read_bytes().startswith(b"%PDF")
     assert written.stat().st_size > 0
 
+    reader = PdfReader(written)
+    assert len(reader.pages) >= 2
+
     text = _pdf_text(written)
     assert "EduRAG" in text
     assert "Fiche de révision" in text
@@ -106,6 +113,8 @@ def test_build_pdf_from_markdown_without_ir(tmp_path: Path) -> None:
     assert "L'été, une fonction peut être créée." in text
     assert "Une variable nomme une valeur." in text
     assert "Retenir la portée locale." in text
+    assert "Définition" in text
+    assert "À retenir" in text or "retenir" in text.casefold()
     assert "x = 1" in text
     assert "tiroir" in text
     assert "Valeur nommée" in text

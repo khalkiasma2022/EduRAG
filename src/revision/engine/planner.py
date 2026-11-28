@@ -6,11 +6,11 @@ Mode unique : fiche complète structurée, tous les concepts pertinents, aucune 
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from pydantic import ValidationError
 
+from src.revision.engine.json_util import load_json_object
 from src.revision.engine.llm_guard import (
     LEGACY_STORE_LEVEL,
     LEGACY_STORE_SHEET_TYPE,
@@ -29,8 +29,8 @@ from src.revision.engine.models import (
     LearningObjective,
     PedagogicalPlan,
 )
+from src.revision.engine.progress import log_progress
 
-_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 _LANGUAGES = frozenset({"fr", "en", "ar"})
 
 
@@ -60,6 +60,9 @@ class PedagogicalPlanner:
         # Refus avant appel LLM : graphe cyclique → erreur explicite (pas de fallback).
         _ensure_acyclic_dependencies(course.concepts)
 
+        log_progress(
+            f"Planification pédagogique ({len(course.concepts)} concepts)…"
+        )
         prompt = _build_plan_prompt(course, language)
 
         def produce() -> str:
@@ -153,7 +156,7 @@ def _build_plan_prompt(course: CourseModel, language: str) -> str:
 
 def _load_plan_payload(raw: str) -> dict[str, Any]:
     try:
-        return _load_json_object(raw)
+        return load_json_object(raw)
     except ValueError as error:
         raise ValueError("JSON de planification invalide.") from error
 
@@ -364,16 +367,3 @@ def _chapter_title(group: list[Concept], index: int) -> str:
     labels = ", ".join(c.label for c in group[:2])
     return f"Chapitre {index + 1} : {labels}"
 
-
-def _load_json_object(raw: str) -> dict[str, Any]:
-    text = raw.strip()
-    fence = _JSON_FENCE.search(text)
-    if fence:
-        text = fence.group(1).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ValueError("JSON invalide.") from error
-    if not isinstance(data, dict):
-        raise ValueError("JSON invalide.")
-    return data

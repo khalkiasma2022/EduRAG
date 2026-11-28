@@ -22,21 +22,20 @@ from src.revision.sheet import (
 # calls_worst  = attempts * (W + 1 + C + R)
 #
 # Avec W=C=10 et R=2 :
-#   nominal = 3840 + 512 + 6400 + 768 = 11520
-#   worst   = 2 * 11520 = 23040 <= 24000
+#   nominal = 10240 + 512 + 7680 + 768 = 19200
+#   worst   = 2 * 19200 = 38400 <= 39000
 #   calls   = 2 * (10 + 1 + 10 + 2) = 46 <= 48
-# Marge restante au pire cas : 960 tokens et 2 appels.
+# Marge restante au pire cas : 600 tokens et 2 appels.
 #
-# 20 fenêtres + 20 chapitres n'est PAS garanti avec retries
-# (worst ≈ 43520 tokens / 86 appels).
+# 20 fenêtres + 20 chapitres n'est PAS garanti avec retries.
 # ---------------------------------------------------------------------------
 MAX_COURSE_TOKENS_PER_WINDOW = 1800
 MAX_ANALYSIS_WINDOWS = 10
 MAX_CHAPTERS = 10
 MAX_CONCEPTS_PER_CHAPTER = 4
-TOKENS_UNDERSTANDING = 384
+TOKENS_UNDERSTANDING = 1024
 TOKENS_PLAN = 512
-TOKENS_CHAPTER = 640
+TOKENS_CHAPTER = 768
 # Alias legacy (tests / anciens imports).
 MAX_CHAPTERS_SHORT = MAX_CHAPTERS
 MAX_CHAPTERS_COMPLETE = MAX_CHAPTERS
@@ -46,12 +45,12 @@ TOKENS_REWRITE = 384
 MAX_RETRIES_PER_CALL = 1
 MAX_REWRITE_CHAPTERS = 2
 MAX_LLM_CALLS = 48
-MAX_TOTAL_NEW_TOKENS = 24000
+MAX_TOTAL_NEW_TOKENS = 39000
 
-# Densité pédagogique : 640 tokens / 4 concepts ≈ 160 tokens utiles par notion.
+# Densité pédagogique : 768 tokens / 4 concepts ≈ 192 tokens utiles par notion.
 # Au-delà, la génération produit typiquement des fiches incomplètes.
 # Capacité cours sans densification forcée : 10 × 4 = 40 concepts.
-MIN_TOKENS_PER_CONCEPT = TOKENS_CHAPTER // MAX_CONCEPTS_PER_CHAPTER
+MIN_TOKENS_PER_CONCEPT = TOKENS_CHAPTER // MAX_CONCEPTS_PER_CHAPTER  # 192
 MAX_COURSE_CONCEPTS = MAX_CHAPTERS * MAX_CONCEPTS_PER_CHAPTER
 
 # Valeurs techniques persistées (compatibilité SQLite) — non exposées à l'UI.
@@ -124,26 +123,33 @@ def ensure_pipeline_capacity(
     chapters: int = MAX_CHAPTERS,
     *,
     rewrites: int = MAX_REWRITE_CHAPTERS,
+    skip_understanding: bool = False,
 ) -> None:
     """Refuse avant démarrage si le pire cas (retries inclus) dépasse les plafonds."""
-    if not isinstance(windows, int) or isinstance(windows, bool) or windows < 1:
+    if not isinstance(windows, int) or isinstance(windows, bool) or windows < 0:
         raise ValueError("Les fenêtres du cours sont invalides.")
     if not isinstance(chapters, int) or isinstance(chapters, bool) or chapters < 1:
         raise ValueError("Le nombre de chapitres est invalide.")
-    if windows > MAX_ANALYSIS_WINDOWS:
-        raise ValueError(
-            "Le cours sélectionné dépasse la capacité d'analyse "
-            f"({MAX_ANALYSIS_WINDOWS} fenêtres). "
-            "Réduisez la taille du document ou découpez le cours."
-        )
+    if skip_understanding:
+        billed_windows = 0
+    else:
+        if windows < 1:
+            raise ValueError("Les fenêtres du cours sont invalides.")
+        billed_windows = windows
+        if windows > MAX_ANALYSIS_WINDOWS:
+            raise ValueError(
+                "Le cours sélectionné dépasse la capacité d'analyse "
+                f"({MAX_ANALYSIS_WINDOWS} fenêtres). "
+                "Réduisez la taille du document ou découpez le cours."
+            )
     if chapters > MAX_CHAPTERS:
         raise ValueError(
             "Le plan pédagogique dépasse la capacité de génération "
             f"({MAX_CHAPTERS} chapitres)."
         )
 
-    tokens = pipeline_token_cost(windows, chapters, rewrites=rewrites)
-    calls = pipeline_call_cost(windows, chapters, rewrites=rewrites)
+    tokens = pipeline_token_cost(billed_windows, chapters, rewrites=rewrites)
+    calls = pipeline_call_cost(billed_windows, chapters, rewrites=rewrites)
     if tokens > MAX_TOTAL_NEW_TOKENS or calls > MAX_LLM_CALLS:
         raise ValueError(
             "Le cours sélectionné dépasse le budget LLM garanti pour une fiche "

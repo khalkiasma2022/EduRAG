@@ -31,6 +31,12 @@ streamlit==1.67.0
 # Embeddings de phrases
 sentence-transformers==6.3.0
 
+# PyTorch : sentence-transformers tire souvent un build CPU.
+# Après `pip install -r requirements.txt`, installez CUDA torch, par ex. :
+#   pip uninstall -y torch
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+# EduRAG exige CUDA pour le LLM et les embeddings (pas de repli CPU).
+
 # Chargement des clés depuis le fichier .env
 python-dotenv==1.2.4
 

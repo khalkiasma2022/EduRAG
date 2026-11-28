@@ -7,6 +7,7 @@ Les helpers de lecture / prompt V1 restent disponibles pour les tests et l'expor
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 from src.generation.llm import MAX_NEW_TOKENS_LIMIT
 from src.ingestion.pdf_loader import load_pdf
@@ -235,10 +236,12 @@ class RevisionSheet:
         llm: object,
         *,
         engine_factory: Callable[[object, object], object] | None = None,
+        course_cache_dir: str | Path | None = None,
     ) -> None:
         """Conserve la bibliothèque et le modèle déjà créés.
 
         engine_factory permet d'injecter RevisionEngine (tests) sans second Qwen.
+        course_cache_dir active le cache de compréhension (CourseModel) sur disque.
         """
         if not callable(getattr(library, "list_documents", None)):
             raise TypeError("library doit fournir list_documents.")
@@ -248,6 +251,9 @@ class RevisionSheet:
         self.library = library
         self.llm = llm
         self._engine_factory = engine_factory
+        self._course_cache_dir = (
+            Path(course_cache_dir) if course_cache_dir is not None else None
+        )
 
     def read_pages(
         self,
@@ -343,9 +349,19 @@ class RevisionSheet:
             engine = self._engine_factory(self.library, self.llm)
         else:
             # Import local pour éviter le cycle sheet ↔ llm_guard ↔ facade.
+            from src.revision.engine.course_cache import CourseUnderstandingCache
             from src.revision.engine.facade import RevisionEngine
 
-            engine = RevisionEngine(self.library, self.llm)
+            cache = (
+                CourseUnderstandingCache(self._course_cache_dir)
+                if self._course_cache_dir is not None
+                else None
+            )
+            engine = RevisionEngine(
+                self.library,
+                self.llm,
+                course_cache=cache,
+            )
 
         if getattr(engine, "llm", None) is not self.llm:
             raise ValueError(

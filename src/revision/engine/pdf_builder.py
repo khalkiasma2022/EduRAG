@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -21,15 +22,40 @@ from src.revision.engine.formatter import (
     parse_markdown,
 )
 
-# Palette EduRAG — ardoise / teal
-COLOR_SLATE = (47, 62, 70)
-COLOR_TEAL = (13, 148, 136)
+# ---------------------------------------------------------------------------
+# Palette EduRAG — ardoise / teal (académique)
+# ---------------------------------------------------------------------------
+COLOR_SLATE = (31, 51, 64)  # #1F3340
+COLOR_TEAL = (15, 118, 110)  # #0F766E
 COLOR_SLATE_SOFT = (232, 236, 238)
 COLOR_TEAL_SOFT = (224, 242, 240)
 COLOR_AMBER_SOFT = (255, 247, 230)
 COLOR_VIOLET_SOFT = (243, 240, 255)
-COLOR_INK = (33, 37, 41)
-COLOR_MUTED = (100, 116, 139)
+COLOR_INK = (30, 41, 59)  # #1E293B
+COLOR_MUTED = (100, 116, 139)  # #64748B
+COLOR_RULE = (203, 213, 225)
+COLOR_WHITE = (255, 255, 255)
+
+# Espacement (mm)
+MARGIN_LEFT = 20.0
+MARGIN_TOP = 22.0
+MARGIN_RIGHT = 20.0
+MARGIN_BOTTOM = 24.0
+GAP_AFTER_H1 = 8.0
+GAP_AFTER_H2 = 5.0
+GAP_AFTER_H3 = 3.0
+GAP_PARAGRAPH = 3.0
+GAP_CALLOUT = 4.0
+ACCENT_BAR_W = 2.5
+BODY_LINE_H = 6.2
+BODY_SIZE = 11
+CAPTION_SIZE = 9
+META_SIZE = 10
+
+# Échelle typographique
+SIZE_H1 = 20
+SIZE_H2 = 15
+SIZE_H3 = 12.5
 
 AR_FONT_PATH = (
     Path(__file__).resolve().parents[3] / "assets" / "fonts" / "NotoNaskhArabic-Regular.ttf"
@@ -99,6 +125,7 @@ class ProfessionalPDFBuilder:
 
 def _normalize_meta(meta: dict[str, Any] | None) -> dict[str, Any]:
     data = dict(meta or {})
+    created = data.get("created_at")
     return {
         "filename": str(data.get("filename") or "cours.pdf"),
         "page_start": int(data.get("page_start") or 1),
@@ -106,6 +133,7 @@ def _normalize_meta(meta: dict[str, Any] | None) -> dict[str, Any]:
         "language": str(data.get("language") or "fr"),
         "level": str(data.get("level") or "beginner"),
         "sheet_type": str(data.get("sheet_type") or "complete"),
+        "created_at": str(created).strip() if isinstance(created, str) and created.strip() else "",
     }
 
 
@@ -114,8 +142,8 @@ class _RevisionPDF(FPDF):
         super().__init__(format="A4")
         self.language = language if language in _TEXT_DIRECTIONS else "fr"
         self._course_label = ""
-        self.set_auto_page_break(auto=True, margin=22)
-        self.set_margins(18, 20, 18)
+        self.set_auto_page_break(auto=True, margin=MARGIN_BOTTOM)
+        self.set_margins(MARGIN_LEFT, MARGIN_TOP, MARGIN_RIGHT)
         if not AR_FONT_PATH.is_file():
             raise RuntimeError("La police Noto Naskh Arabic est introuvable.")
         self.add_font(AR_FONT_FAMILY, fname=str(AR_FONT_PATH))
@@ -132,24 +160,28 @@ class _RevisionPDF(FPDF):
     def header(self) -> None:
         if self.page_no() == 1:
             return
-        self.set_font(self._font, size=9)
+        self.set_font(self._font, size=CAPTION_SIZE)
         self.set_text_color(*COLOR_MUTED)
-        self.cell(0, 8, text="EduRAG · Smart Revision", align=self.align)
+        self.cell(0, 7, text="EduRAG · Smart Revision", align=self.align)
         self.set_draw_color(*COLOR_TEAL)
-        self.set_line_width(0.4)
-        y = self.get_y() + 1
+        self.set_line_width(0.45)
+        y = self.get_y() + 1.5
         self.line(self.l_margin, y, self.w - self.r_margin, y)
-        self.ln(6)
+        self.ln(8)
         self.set_text_color(*COLOR_INK)
 
     def footer(self) -> None:
-        self.set_y(-16)
-        self.set_font(self._font, size=9)
+        self.set_y(-18)
+        self.set_draw_color(*COLOR_RULE)
+        self.set_line_width(0.3)
+        self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+        self.ln(2)
+        self.set_font(self._font, size=CAPTION_SIZE)
         self.set_text_color(*COLOR_MUTED)
         label = self._course_label
         left = label if label else "EduRAG"
-        self.cell(self.epw / 2, 8, text=left, align="L")
-        self.cell(self.epw / 2, 8, text=str(self.page_no()), align="R")
+        self.cell(self.epw / 2, 7, text=left, align="L")
+        self.cell(self.epw / 2, 7, text=str(self.page_no()), align="R")
         self.set_text_color(*COLOR_INK)
 
     def build(self, blocks: list[MarkdownBlock], meta: dict[str, Any]) -> None:
@@ -161,16 +193,18 @@ class _RevisionPDF(FPDF):
 
     def _write_cover(self, meta: dict[str, Any]) -> None:
         self.add_page()
+        band_h = 58.0
         self.set_fill_color(*COLOR_SLATE)
-        self.rect(0, 0, self.w, 48, style="F")
+        self.rect(0, 0, self.w, band_h, style="F")
         self.set_fill_color(*COLOR_TEAL)
-        self.rect(0, 48, self.w, 4, style="F")
+        self.rect(0, band_h, self.w, 3.5, style="F")
 
-        self.set_y(18)
-        self.set_font(self._font, size=14)
-        self.set_text_color(255, 255, 255)
+        self.set_y(20)
+        self.set_font(self._font, size=16)
+        self.set_text_color(*COLOR_WHITE)
         self.cell(0, 10, text="EduRAG", align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         self.set_font(self._font, size=11)
+        self.set_text_color(204, 251, 241)
         self.cell(
             0,
             8,
@@ -180,9 +214,9 @@ class _RevisionPDF(FPDF):
             new_y=YPos.NEXT,
         )
 
-        self.set_y(70)
+        self.set_y(band_h + 22)
         self.set_text_color(*COLOR_SLATE)
-        self.set_font(self._font, size=22)
+        self.set_font(self._font, size=24)
         self.multi_cell(
             0,
             12,
@@ -191,27 +225,28 @@ class _RevisionPDF(FPDF):
             new_x=XPos.LMARGIN,
             new_y=YPos.NEXT,
         )
-        self.ln(4)
+        self.ln(6)
         self.set_draw_color(*COLOR_TEAL)
-        self.set_line_width(0.8)
+        self.set_line_width(1.0)
         mid = self.w / 2
-        self.line(mid - 28, self.get_y(), mid + 28, self.get_y())
-        self.ln(10)
+        self.line(mid - 22, self.get_y(), mid + 22, self.get_y())
+        self.ln(14)
 
-        self.set_font(self._font, size=12)
-        self.set_text_color(*COLOR_INK)
         pages = _format_pages(int(meta["page_start"]), int(meta["page_end"]))
-        for line in (
+        meta_lines: list[str] = [
             f"Cours : {meta['filename']}",
             f"Pages : {pages}",
             f"Langue : {_LANGUAGE_LABELS.get(str(meta['language']), str(meta['language']))}",
             f"Niveau : {_LEVEL_LABELS.get(str(meta['level']), str(meta['level']))}",
             f"Type : {_TYPE_LABELS.get(str(meta['sheet_type']), str(meta['sheet_type']))}",
-        ):
-            self.cell(0, 9, text=line, align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        ]
+        created_at = str(meta.get("created_at") or "").strip()
+        if created_at:
+            meta_lines.append(f"Date de création : {created_at}")
+        self._write_meta_card(tuple(meta_lines))
 
         self.set_y(self.h - 40)
-        self.set_font(self._font, size=10)
+        self.set_font(self._font, size=META_SIZE)
         self.set_text_color(*COLOR_MUTED)
         self.cell(
             0,
@@ -222,6 +257,37 @@ class _RevisionPDF(FPDF):
             new_y=YPos.NEXT,
         )
         self.set_text_color(*COLOR_INK)
+
+    def _write_meta_card(self, lines: tuple[str, ...]) -> None:
+        line_h = 8.0
+        pad_y = 8.0
+        pad_x = 10.0
+        box_h = pad_y * 2 + line_h * len(lines)
+        box_w = min(self.epw, 140.0)
+        x = (self.w - box_w) / 2
+        y = self.get_y()
+
+        self.set_fill_color(*COLOR_SLATE_SOFT)
+        self.set_draw_color(*COLOR_RULE)
+        self.set_line_width(0.35)
+        self.rect(x, y, box_w, box_h, style="DF")
+        self.set_fill_color(*COLOR_TEAL)
+        self.rect(x, y, ACCENT_BAR_W, box_h, style="F")
+
+        self.set_xy(x + pad_x, y + pad_y)
+        self.set_font(self._font, size=META_SIZE + 1)
+        self.set_text_color(*COLOR_INK)
+        for line in lines:
+            self.set_x(x + pad_x)
+            self.cell(
+                box_w - pad_x * 2,
+                line_h,
+                text=line,
+                align="C",
+                new_x=XPos.LMARGIN,
+                new_y=YPos.NEXT,
+            )
+        self.set_y(y + box_h + 6)
 
     def _write_block(self, block: MarkdownBlock) -> None:
         if isinstance(block, MdHeading):
@@ -243,20 +309,69 @@ class _RevisionPDF(FPDF):
             self._write_heading(block.level, "Synthèse")
             for item in block.items:
                 self._write_bullet(item)
-            self.ln(2)
+            self.ln(GAP_PARAGRAPH)
             return
         if isinstance(block, MdQuestions):
             self._write_heading(block.level, "Questions de révision")
             for number, item in enumerate(block.items, start=1):
-                self._write_paragraph(f"{number}. {item}", size=11)
-            self.ln(2)
+                self._write_paragraph(f"{number}. {item}", size=BODY_SIZE)
+            self.ln(GAP_PARAGRAPH)
 
     def _write_heading(self, level: int, text: str) -> None:
-        sizes = {1: 18, 2: 15, 3: 13}
-        size = sizes.get(level, 12)
-        self.ln(2 if level > 1 else 1)
+        sizes = {1: SIZE_H1, 2: SIZE_H2, 3: SIZE_H3}
+        size = sizes.get(level, BODY_SIZE)
+        gaps = {1: GAP_AFTER_H1, 2: GAP_AFTER_H2, 3: GAP_AFTER_H3}
+        after = gaps.get(level, GAP_AFTER_H3)
+
+        self.ln(5 if level == 1 else 3 if level == 2 else 2)
+
+        if level == 1:
+            self._write_h1(text, size)
+        elif level == 2:
+            self._write_h2(text, size)
+        else:
+            self.set_font(self._font, size=size)
+            self.set_text_color(*COLOR_MUTED if level >= 3 else COLOR_SLATE)
+            self.multi_cell(
+                0,
+                size * 0.55,
+                text=text,
+                align=self.align,
+                new_x=XPos.LMARGIN,
+                new_y=YPos.NEXT,
+            )
+
+        self.ln(after)
+        self.set_text_color(*COLOR_INK)
+        self.set_font(self._font, size=BODY_SIZE)
+
+    def _write_h1(self, text: str, size: float) -> None:
+        bar = ACCENT_BAR_W
+        indent = bar + 3.0
+        y0 = self.get_y()
         self.set_font(self._font, size=size)
-        self.set_text_color(*COLOR_SLATE if level == 1 else COLOR_TEAL if level == 2 else COLOR_SLATE)
+        self.set_text_color(*COLOR_SLATE)
+        self.set_x(self.l_margin + indent)
+        self.multi_cell(
+            self.epw - indent,
+            size * 0.55,
+            text=text,
+            align=self.align,
+            new_x=XPos.LMARGIN,
+            new_y=YPos.NEXT,
+        )
+        y1 = self.get_y()
+        self.set_fill_color(*COLOR_TEAL)
+        self.rect(self.l_margin, y0, bar, max(6.0, y1 - y0), style="F")
+        self.set_draw_color(*COLOR_RULE)
+        self.set_line_width(0.4)
+        underline_y = y1 + 1.2
+        self.line(self.l_margin, underline_y, self.w - self.r_margin, underline_y)
+        self.set_y(underline_y + 1.5)
+
+    def _write_h2(self, text: str, size: float) -> None:
+        self.set_font(self._font, size=size)
+        self.set_text_color(*COLOR_TEAL)
         self.multi_cell(
             0,
             size * 0.55,
@@ -265,45 +380,81 @@ class _RevisionPDF(FPDF):
             new_x=XPos.LMARGIN,
             new_y=YPos.NEXT,
         )
-        if level <= 2:
-            self.set_draw_color(*(COLOR_TEAL if level == 2 else COLOR_SLATE))
-            self.set_line_width(0.35)
-            y = self.get_y() + 0.5
-            self.line(self.l_margin, y, self.w - self.r_margin, y)
-            self.ln(3)
+        self.set_draw_color(*COLOR_TEAL)
+        self.set_line_width(0.7)
+        y = self.get_y() + 0.8
+        underline_w = self.epw * 0.4
+        if self.align == "R":
+            x0 = self.w - self.r_margin - underline_w
+            x1 = self.w - self.r_margin
         else:
-            self.ln(2)
-        self.set_text_color(*COLOR_INK)
-        self.set_font(self._font, size=11)
+            x0 = self.l_margin
+            x1 = self.l_margin + underline_w
+        self.line(x0, y, x1, y)
+        self.set_y(y + 1.2)
 
-    def _write_paragraph(self, text: str, size: int = 11) -> None:
+    def _write_paragraph(self, text: str, size: float = BODY_SIZE) -> None:
+        bullet = re.match(r"^\s*[-*]\s+(\S.*)$", text)
+        if bullet:
+            self._write_bullet(bullet.group(1).strip())
+            return
+        numbered = re.match(r"^\s*(\d+[.)])\s+(\S.*)$", text)
+        if numbered:
+            self.set_font(self._font, size=size)
+            self.set_text_color(*COLOR_INK)
+            indent = 4.0
+            self.set_x(self.l_margin + indent)
+            self.multi_cell(
+                self.epw - indent,
+                BODY_LINE_H,
+                text=f"{numbered.group(1)} {numbered.group(2).strip()}",
+                align=self.align,
+                new_x=XPos.LMARGIN,
+                new_y=YPos.NEXT,
+            )
+            self.ln(1.5)
+            return
+
         self.set_font(self._font, size=size)
         self.set_text_color(*COLOR_INK)
         self.multi_cell(
             0,
-            6,
+            BODY_LINE_H,
             text=text,
+            align=self.align,
+            new_x=XPos.LMARGIN,
+            new_y=YPos.NEXT,
+        )
+        self.ln(GAP_PARAGRAPH)
+
+    def _write_bullet(self, text: str) -> None:
+        indent = 4.0
+        self.set_font(self._font, size=BODY_SIZE)
+        self.set_text_color(*COLOR_INK)
+        self.set_x(self.l_margin + indent)
+        self.multi_cell(
+            self.epw - indent,
+            BODY_LINE_H,
+            text=f"• {text}",
             align=self.align,
             new_x=XPos.LMARGIN,
             new_y=YPos.NEXT,
         )
         self.ln(1.5)
 
-    def _write_bullet(self, text: str) -> None:
-        self._write_paragraph(f"• {text}", size=11)
-
-    def _write_callout(self, kind: str, text: str) -> None:
-        style = _CALLOUT_STYLES[kind]
-        label = str(style["label"])
-        fill = style["fill"]
-        border = style["border"]
-        body = f"{label}. {text}" if not text.startswith(label) else text
-
-        self.set_font(self._font, size=11)
-        # Estimation de hauteur pour le fond
-        line_height = 6
-        usable = self.epw - 8
-        # Découpe approximative pour réserver la boîte
+    def _write_accent_panel(
+        self,
+        *,
+        body: str,
+        fill: tuple[int, int, int],
+        border: tuple[int, int, int],
+        min_h: float = 14.0,
+    ) -> None:
+        self.set_font(self._font, size=BODY_SIZE)
+        pad_x = 6.0
+        pad_y = 4.5
+        line_height = BODY_LINE_H
+        usable = self.epw - pad_x * 2 - ACCENT_BAR_W
         words = body.split()
         lines_est = 1
         current = ""
@@ -314,7 +465,7 @@ class _RevisionPDF(FPDF):
             else:
                 lines_est += 1
                 current = word
-        box_h = max(14.0, lines_est * line_height + 8)
+        box_h = max(min_h, lines_est * line_height + pad_y * 2)
 
         if self.get_y() + box_h > self.page_break_trigger:
             self.add_page()
@@ -322,61 +473,61 @@ class _RevisionPDF(FPDF):
         x = self.l_margin
         y = self.get_y()
         self.set_fill_color(*fill)
-        self.set_draw_color(*border)
-        self.set_line_width(0.6)
+        self.set_draw_color(*COLOR_RULE)
+        self.set_line_width(0.35)
         self.rect(x, y, self.epw, box_h, style="DF")
-        self.set_xy(x + 4, y + 3)
+        self.set_fill_color(*border)
+        self.rect(x, y, ACCENT_BAR_W, box_h, style="F")
+
+        self.set_xy(x + ACCENT_BAR_W + pad_x - 1, y + pad_y)
         self.set_text_color(*COLOR_SLATE)
         self.multi_cell(
-            self.epw - 8,
+            self.epw - ACCENT_BAR_W - pad_x * 2 + 1,
             line_height,
             text=body,
             align=self.align,
             new_x=XPos.LMARGIN,
             new_y=YPos.NEXT,
         )
-        self.set_y(y + box_h + 3)
+        self.set_y(y + box_h + GAP_CALLOUT)
         self.set_text_color(*COLOR_INK)
 
+    def _write_callout(self, kind: str, text: str) -> None:
+        style = _CALLOUT_STYLES[kind]
+        label = str(style["label"])
+        fill = style["fill"]
+        border = style["border"]
+        body = f"{label}. {text}" if not text.startswith(label) else text
+        self._write_accent_panel(body=body, fill=fill, border=border)
+
     def _write_diagram(self, text: str) -> None:
-        self.set_fill_color(*COLOR_SLATE_SOFT)
-        self.set_draw_color(*COLOR_SLATE)
-        self.set_line_width(0.4)
         body = f"Schéma : {text}"
-        self.set_font(self._font, size=11)
-        height = 16
-        if self.get_y() + height > self.page_break_trigger:
-            self.add_page()
-        x, y = self.l_margin, self.get_y()
-        self.rect(x, y, self.epw, height, style="DF")
-        self.set_xy(x + 4, y + 4)
-        self.set_text_color(*COLOR_SLATE)
-        self.multi_cell(
-            self.epw - 8,
-            6,
-            text=body,
-            align=self.align,
-            new_x=XPos.LMARGIN,
-            new_y=YPos.NEXT,
+        self._write_accent_panel(
+            body=body,
+            fill=COLOR_SLATE_SOFT,
+            border=COLOR_SLATE,
+            min_h=16.0,
         )
-        self.set_y(y + height + 3)
-        self.set_text_color(*COLOR_INK)
 
     def _write_table(self, headers: list[str], rows: list[list[str]]) -> None:
         table_rows = [list(headers)] + [list(row) for row in rows]
         width = max(len(row) for row in table_rows)
-        self.set_font(self._font, size=10)
+        self.set_font(self._font, size=META_SIZE)
         with self.table(
             text_align=self.align,
             width=self.epw,
             first_row_as_headings=True,
-            headings_style=FontFace(emphasis="", color=COLOR_SLATE, fill_color=COLOR_TEAL_SOFT),
-            line_height=7,
+            headings_style=FontFace(
+                emphasis="",
+                color=COLOR_SLATE,
+                fill_color=COLOR_TEAL_SOFT,
+            ),
+            line_height=8,
         ) as table:
             for row in table_rows:
                 cells = row + [""] * (width - len(row))
                 table.row(cells)
-        self.ln(3)
+        self.ln(GAP_CALLOUT)
 
 
 def _format_pages(page_start: int, page_end: int) -> str:

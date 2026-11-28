@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from src.revision.engine.course_cache import CourseUnderstandingCache
 from src.revision.engine.facade import RevisionEngine
 from src.revision.engine.formatter import ContentFormatter
 from src.revision.engine.llm_guard import (
@@ -308,6 +311,7 @@ def _build_engine(
     understanding_error: Exception | None = None,
     planner_error: Exception | None = None,
     generator_error: Exception | None = None,
+    course_cache: CourseUnderstandingCache | None = None,
 ):
     llm = SharedLLM()
     guard = LlmBudgetGuard()
@@ -358,6 +362,7 @@ def _build_engine(
         generator=generator,  # type: ignore[arg-type]
         quality=quality,  # type: ignore[arg-type]
         formatter=formatter,  # type: ignore[arg-type]
+        course_cache=course_cache,
     )
     return engine, reader, understanding, planner, generator, quality, formatter, guard, llm
 
@@ -562,3 +567,16 @@ def test_does_not_save_or_touch_store() -> None:
         "level",
         "sheet_type",
     }
+
+
+def test_course_cache_skips_understanding_on_second_run(tmp_path: Path) -> None:
+    cache = CourseUnderstandingCache(tmp_path / "course_cache")
+    engine1, _r1, understanding1, *_rest1 = _build_engine(course_cache=cache)
+    engine1.run("doc-cache-1")
+    assert len(understanding1.calls) == 1
+    assert cache.load("doc-cache-1") is not None
+
+    engine2, _r2, understanding2, *_rest2 = _build_engine(course_cache=cache)
+    engine2.run("doc-cache-1")
+    assert understanding2.calls == []
+    assert len(engine2.planner.calls) == 1  # type: ignore[attr-defined]

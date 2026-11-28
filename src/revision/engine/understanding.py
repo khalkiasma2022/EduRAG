@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import json
-import re
 from typing import Any
 
+from src.revision.engine.json_util import load_json_object
 from src.revision.engine.llm_guard import (
     TOKENS_UNDERSTANDING,
     LlmBudgetGuard,
@@ -20,6 +19,7 @@ from src.revision.engine.models import (
     CourseRelation,
     CourseUnit,
 )
+from src.revision.engine.progress import log_progress
 
 _KIND_VALUES = frozenset(
     {"definition", "formula", "method", "mechanism", "relation", "other"}
@@ -37,9 +37,6 @@ _KIND_ALIASES: dict[str, str] = {
     "equation": "formula",
     "link": "relation",
 }
-_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
-
-
 class CourseUnderstanding:
     """Construit un CourseModel structuré à partir des fenêtres du cours."""
 
@@ -72,8 +69,16 @@ class CourseUnderstanding:
             )
 
         partials: list[dict[str, Any]] = []
-        for window in windows:
+        total = len(windows)
+        for index, window in enumerate(windows, start=1):
+            page_start = window[0].page_number
+            page_end = window[-1].page_number
+            log_progress(
+                f"Compréhension {index}/{total} "
+                f"(pages {page_start}-{page_end})…"
+            )
             partials.append(self._analyze_window(window))
+        log_progress("Fusion des analyses de compréhension…")
         return self._merge(partials, windows)
 
     def _analyze_window(self, window: list[CoursePage]) -> dict[str, Any]:
@@ -84,10 +89,21 @@ class CourseUnderstanding:
                 ensure_prompt_fits(self.llm, prompt, TOKENS_UNDERSTANDING)
             return self.llm.generate(prompt, max_new_tokens=TOKENS_UNDERSTANDING)
 
+        def parse(raw: str) -> dict[str, Any]:
+            try:
+                return _parse_window_json(raw)
+            except ValueError:
+                preview = " ".join(str(raw).split())[:240]
+                log_progress(
+                    "JSON de compréhension invalide, nouvel essai… "
+                    f"Aperçu: {preview!r}"
+                )
+                raise
+
         return self.guard.run_with_retries(
             produce,
             tokens=TOKENS_UNDERSTANDING,
-            parse=_parse_window_json,
+            parse=parse,
         )
 
     def _merge(
@@ -160,65 +176,69 @@ def _build_understanding_prompt(window: list[CoursePage]) -> str:
     allowed_kinds = ", ".join(sorted(_KIND_VALUES))
     return (
         "Tu es EduRAG. Analyse uniquement les pages fournies.\n"
-        "Réponds UNIQUEMENT en JSON valide, sans Markdown.\n"
-        "Respecte exactement le schéma JSON demandé.\n"
-        "Schéma attendu :\n"
+        "Réponds UNIQUEMENT en JSON valide compact, sans Markdown ni texte autour.\n"
+        "Maximum 8 concepts, notes courtes (≤12 mots), relations utiles seulement.\n"
+        "Schéma exact :\n"
         "{"
-        '"themes": ["..."], '
-        '"concepts": [{"id":"...", "label":"...", "kind":"definition|formula|method|mechanism|relation|other", '
-        '"pages":[1], "essential":true, "depends_on":[], "notes":"...", "same_as":null}], '
-        '"relations": [{"source_id":"...", "target_id":"...", "relation_type":"...", "pages":[1]}], '
-        '"contradictions": [{"concept_id":"...", "description":"...", "pages":[1]}]'
+        '"themes":["..."],'
+        '"concepts":[{"id":"...","label":"...","kind":"definition|formula|method|mechanism|relation|other",'
+        '"pages":[1],"essential":true,"depends_on":[],"notes":"...","same_as":null}],'
+        '"relations":[{"source_id":"...","target_id":"...","relation_type":"...","pages":[1]}],'
+        '"contradictions":[]'
         "}\n"
-        f"Le champ kind doit obligatoirement être l'une de ces six valeurs : {allowed_kinds}.\n"
-        "Aucune autre valeur n'est autorisée pour kind.\n"
-        "Pour une notion de type service informatique (PaaS, IaaS, SaaS), utilise kind=\"other\".\n"
-        "Ne jamais inventer de catégorie comme service, technology, concept ou tool.\n"
-        "Règles : n'invente rien ; same_as seulement si la même notion est déjà identifiée ; "
-        "ne fusionne pas deux notions proches mais distinctes.\n"
+        f"kind ∈ {{{allowed_kinds}}} uniquement ; pour PaaS/IaaS/SaaS utilise kind=\"other\".\n"
+        "Interdit : inventer kind=service/technology/tool/concept.\n"
+        "N'invente rien. Termine toujours le JSON (accolades/crochets fermés).\n"
         f"Pages :\n{pages_block}"
     )
 
 
 def _parse_window_json(raw: str) -> dict[str, Any]:
     try:
-        payload = _load_json_object(raw)
+        payload = load_json_object(raw)
     except ValueError as error:
         raise ValueError("JSON de compréhension invalide.") from error
 
-    if not isinstance(payload.get("themes"), list):
+    themes = payload.get("themes", [])
+    concepts = payload.get("concepts", [])
+    if themes is None:
+        themes = []
+    if concepts is None:
+        concepts = []
+    if not isinstance(themes, list):
         raise ValueError("JSON de compréhension invalide.")
-    if not isinstance(payload.get("concepts"), list):
+    if not isinstance(concepts, list):
         raise ValueError("JSON de compréhension invalide.")
-    if "relations" in payload and not isinstance(payload.get("relations"), list):
+    if "relations" in payload and payload.get("relations") is not None and not isinstance(
+        payload.get("relations"), list
+    ):
         raise ValueError("JSON de compréhension invalide.")
-    if "contradictions" in payload and not isinstance(payload.get("contradictions"), list):
+    if "contradictions" in payload and payload.get("contradictions") is not None and not isinstance(
+        payload.get("contradictions"), list
+    ):
         raise ValueError("JSON de compréhension invalide.")
 
+    payload["themes"] = [str(item).strip() for item in themes if str(item).strip()]
+    payload["concepts"] = concepts
     payload.setdefault("relations", [])
     payload.setdefault("contradictions", [])
-    # Validation légère des concepts
+    if payload["relations"] is None:
+        payload["relations"] = []
+    if payload["contradictions"] is None:
+        payload["contradictions"] = []
+
+    cleaned_concepts: list[dict[str, Any]] = []
     for concept in payload["concepts"]:
         if not isinstance(concept, dict):
             raise ValueError("JSON de compréhension invalide.")
-        for key in ("id", "label", "kind", "pages"):
+        for key in ("id", "label", "kind"):
             if key not in concept:
                 raise ValueError("JSON de compréhension invalide.")
+        if "pages" not in concept or concept.get("pages") is None:
+            concept["pages"] = []
+        cleaned_concepts.append(concept)
+    payload["concepts"] = cleaned_concepts
     return payload
-
-
-def _load_json_object(raw: str) -> dict[str, Any]:
-    text = raw.strip()
-    fence = _JSON_FENCE.search(text)
-    if fence:
-        text = fence.group(1).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ValueError("JSON invalide.") from error
-    if not isinstance(data, dict):
-        raise ValueError("JSON invalide.")
-    return data
 
 
 def _normalize_kind(raw_kind: object) -> tuple[str | None, str | None]:
@@ -294,10 +314,18 @@ def _int_list(value: object) -> list[int]:
         raise ValueError("JSON de compréhension invalide.")
     pages: list[int] = []
     for item in value:
-        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+        if isinstance(item, bool):
             raise ValueError("JSON de compréhension invalide.")
-        if item not in pages:
-            pages.append(item)
+        if isinstance(item, int):
+            number = item
+        elif isinstance(item, str) and item.strip().isdigit():
+            number = int(item.strip())
+        else:
+            raise ValueError("JSON de compréhension invalide.")
+        if number < 1:
+            raise ValueError("JSON de compréhension invalide.")
+        if number not in pages:
+            pages.append(number)
     return pages
 
 

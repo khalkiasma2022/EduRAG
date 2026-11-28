@@ -64,7 +64,11 @@ class EduRAGAssistant:
         self.history_window = HistoryWindow()
         self.web_searcher = WebSearcher()
         self.web_answer = WebAnswerComposer(self.llm)
-        self.revision_sheet = RevisionSheet(self.library, self.llm)
+        self.revision_sheet = RevisionSheet(
+            self.library,
+            self.llm,
+            course_cache_dir=self.documents_directory / "course_cache",
+        )
         self.revision_store = RevisionStore(revision_database_path)
         self.revision_export = RevisionExport()
         self.conversation_store = ConversationStore(conversation_database_path)

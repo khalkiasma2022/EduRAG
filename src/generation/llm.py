@@ -10,7 +10,7 @@ import torch
 from dotenv import load_dotenv
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Modèle instructif léger, prévu pour tourner sur un GPU de Colab.
+# Modèle instructif léger, prévu pour tourner sur GPU CUDA.
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_MAX_NEW_TOKENS = 1024
 # Plafond pour éviter une génération trop longue et trop coûteuse en mémoire.
@@ -120,13 +120,16 @@ def _model_name(model_name: str | None) -> str:
 
 
 def _select_device(device: str | None) -> str:
-    """Utilise le GPU CUDA lorsqu'il est disponible, sinon le CPU."""
+    """Exige CUDA par défaut. device='cpu' reste autorisé pour les tests unitaires."""
     if device is None:
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda"
     if not isinstance(device, str) or device not in {"cpu", "cuda"}:
         raise ValueError("Le processeur demandé doit être 'cpu' ou 'cuda'.")
     if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA est demandé, mais aucun GPU n'est disponible.")
+        raise RuntimeError(
+            "CUDA est requis pour EduRAG, mais aucun GPU n'est disponible. "
+            "Installez un PyTorch CUDA (pas le build CPU)."
+        )
     return device
 
 

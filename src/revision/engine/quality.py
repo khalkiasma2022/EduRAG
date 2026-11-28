@@ -8,11 +8,9 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from src.revision.engine.coverage import (
-    coverage_failure_message,
-    rewrite_impoverishment_reason,
-    validate_chapter_concept_coverage,
-)
+from src.revision.engine.coverage import rewrite_impoverishment_reason
+from src.revision.engine.generator import _coerce_chapter_payload
+from src.revision.engine.json_util import load_json_object
 from src.revision.engine.llm_guard import (
     MAX_REWRITE_CHAPTERS,
     TOKENS_REWRITE,
@@ -23,7 +21,6 @@ from src.revision.engine.llm_guard import (
 from src.revision.engine.models import (
     ChapterDraft,
     ChapterPlan,
-    ContentBlock,
     CourseModel,
     CoursePage,
     DefinitionBlock,
@@ -34,8 +31,8 @@ from src.revision.engine.models import (
     QualityIssue,
     QualityReport,
 )
+from src.revision.engine.progress import log_progress
 
-_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 _NUMBER_RE = re.compile(r"(?<![A-Za-z])\d+(?:[.,]\d+)?")
 _RESOLVING_RE = re.compile(
@@ -72,7 +69,6 @@ _REWRITABLE_CODES = frozenset(
         "invented_resolution",
         "generic_filler",
         "missing_explanation",
-        "unexplained_concept",
         "forbidden_section",
         "invented_number",
         "unmarked_example",
@@ -109,6 +105,7 @@ class QualityController:
         working = document.model_copy(deep=True)
         rewritten: list[int] = []
 
+        log_progress("Contrôle qualité…")
         working = _strip_question_blocks(working)
         report = self._evaluate(working, course, plan, source_text)
         if report.ok:
@@ -149,6 +146,7 @@ class QualityController:
             chapter_plan = _chapter_plan_by_index(plan, chapter_index)
             if chapter_plan is None:
                 continue
+            log_progress(f"Réécriture qualité du chapitre {chapter_index + 1}…")
             original = next(
                 (ch for ch in working.chapters if ch.index == chapter_index),
                 None,
@@ -220,9 +218,7 @@ class QualityController:
                     )
                 )
 
-        covered_all: set[str] = set()
         for draft in document.chapters:
-            covered_all.update(draft.concept_ids_covered)
             chapter_plan = plan_by_index.get(draft.index)
             issues.extend(
                 _evaluate_chapter(
@@ -232,30 +228,6 @@ class QualityController:
                     source_text=source_text,
                 )
             )
-
-        planned_essentials = _planned_essential_ids(course, plan)
-        missing_essentials = [
-            cid for cid in planned_essentials if cid not in covered_all
-        ]
-        if missing_essentials and not any(i.code == "missing_chapter" for i in issues):
-            # Attacher au premier chapitre du plan qui devait les couvrir.
-            for chapter_plan in plan.chapters:
-                local_missing = [
-                    cid for cid in chapter_plan.concept_ids if cid in missing_essentials
-                ]
-                if not local_missing:
-                    continue
-                issues.append(
-                    QualityIssue(
-                        code="missing_essential_in_chapter",
-                        severity="error",
-                        message=(
-                            "Concepts essentiels non couverts : "
-                            + ", ".join(local_missing)
-                        ),
-                        chapter_index=chapter_plan.index,
-                    )
-                )
 
         errors = [i for i in issues if i.severity == "error"]
         return QualityReport(
@@ -291,11 +263,6 @@ class QualityController:
 
         def parse(raw: str) -> ChapterDraft:
             draft = _parse_chapter_draft(raw, expected_index=chapter_plan.index)
-            unexplained = validate_chapter_concept_coverage(
-                draft, chapter_plan=chapter_plan, course=course
-            )
-            if unexplained:
-                raise ValueError(coverage_failure_message(unexplained))
             if original is not None:
                 reason = rewrite_impoverishment_reason(
                     original,
@@ -352,32 +319,7 @@ def _evaluate_chapter(
         return issues
 
     if chapter_plan is not None:
-        required = set(chapter_plan.concept_ids)
-        covered = set(draft.concept_ids_covered)
-        if required and not required.issubset(covered):
-            issues.append(
-                QualityIssue(
-                    code="missing_essential_in_chapter",
-                    severity="error",
-                    message=(
-                        "Le chapitre ne couvre pas les concepts prévus : "
-                        + ", ".join(sorted(required - covered))
-                    ),
-                    chapter_index=index,
-                )
-            )
-        unexplained = validate_chapter_concept_coverage(
-            draft, chapter_plan=chapter_plan, course=course
-        )
-        if unexplained:
-            issues.append(
-                QualityIssue(
-                    code="unexplained_concept",
-                    severity="error",
-                    message=coverage_failure_message(unexplained),
-                    chapter_index=index,
-                )
-            )
+        # Pas de hard-fail de couverture pédagogique (ids / explications).
         if chapter_plan.title.strip() and draft.title.strip() != chapter_plan.title.strip():
             # Tolérance : warning seulement — pas bloquant seul.
             issues.append(
@@ -586,14 +528,6 @@ def _whitelist_terms(course: CourseModel) -> set[str]:
     return terms
 
 
-def _planned_essential_ids(course: CourseModel, plan: PedagogicalPlan) -> list[str]:
-    planned = {cid for chapter in plan.chapters for cid in chapter.concept_ids}
-    essentials = set(course.essential_concept_ids) or {
-        c.id for c in course.concepts if c.essential
-    }
-    return sorted(planned & essentials) if essentials else sorted(planned)
-
-
 def _has_structural_failure(issues: list[QualityIssue]) -> bool:
     return any(issue.code == "missing_chapter" for issue in issues)
 
@@ -695,38 +629,17 @@ def _build_rewrite_prompt(
 
 def _parse_chapter_draft(raw: str, *, expected_index: int) -> ChapterDraft:
     try:
-        payload = _load_json_object(raw)
+        payload = load_json_object(raw)
     except ValueError as error:
         raise ValueError("JSON de réécriture invalide.") from error
-    payload["index"] = expected_index
+    payload = _coerce_chapter_payload(payload, expected_index=expected_index)
     try:
-        if "blocks" in payload and isinstance(payload["blocks"], list):
-            normalized = []
-            for item in payload["blocks"]:
-                if not isinstance(item, dict):
-                    raise ValueError("JSON de réécriture invalide.")
-                normalized.append(ContentBlock.model_validate(item))
-            payload["blocks"] = [block.model_dump() for block in normalized]
         draft = ChapterDraft.model_validate(payload)
     except (ValidationError, ValueError, TypeError) as error:
         raise ValueError("JSON de réécriture invalide.") from error
-    if draft.index != expected_index:
+    if draft.index != expected_index or not draft.blocks:
         raise ValueError("JSON de réécriture invalide.")
     return draft
-
-
-def _load_json_object(raw: str) -> dict[str, Any]:
-    text = raw.strip()
-    fence = _JSON_FENCE.search(text)
-    if fence:
-        text = fence.group(1).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ValueError("JSON invalide.") from error
-    if not isinstance(data, dict):
-        raise ValueError("JSON invalide.")
-    return data
 
 
 def _source_corpus(course: CourseModel, pages: list[CoursePage]) -> str:

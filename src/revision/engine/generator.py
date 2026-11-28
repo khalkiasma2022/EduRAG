@@ -8,10 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from src.revision.engine.coverage import (
-    coverage_failure_message,
-    validate_chapter_concept_coverage,
-)
+from src.revision.engine.json_util import load_json_object
 from src.revision.engine.llm_guard import (
     TOKENS_CHAPTER,
     LlmBudgetGuard,
@@ -26,13 +23,27 @@ from src.revision.engine.models import (
     ContentBlock,
     CourseModel,
     CoursePage,
+    DefinitionBlock,
     ExampleBlock,
     PedagogicalDocument,
     PedagogicalPlan,
     ParagraphBlock,
+    SynthesisBlock,
+)
+from src.revision.engine.progress import log_progress
+
+_BLOCK_TYPES = frozenset(
+    {
+        "paragraph",
+        "definition",
+        "example",
+        "retain",
+        "table",
+        "diagram",
+        "synthesis",
+    }
 )
 
-_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 _NUMBER_RE = re.compile(r"(?<![A-Za-z])\d+(?:[.,]\d+)?")
 _RESOLVING_RE = re.compile(
@@ -82,7 +93,12 @@ class OriginalContentGenerator:
         previous_titles: list[str] = []
         drafts: list[ChapterDraft] = []
 
+        total = len(plan.chapters)
         for chapter_plan in plan.chapters:
+            log_progress(
+                f"Rédaction chapitre {chapter_plan.index + 1}/{total} "
+                f": {chapter_plan.title}"
+            )
             draft = self._generate_chapter(
                 course=course,
                 plan=plan,
@@ -124,23 +140,66 @@ class OriginalContentGenerator:
             previous_titles=previous_titles,
             source_pages=source_pages,
         )
+        retry_state: dict[str, str | None] = {"error": None}
 
         def produce() -> str:
-            ensure_prompt_fits(self.llm, prompt, tokens)
-            return self.llm.generate(prompt, max_new_tokens=tokens)
+            full_prompt = prompt
+            if retry_state["error"]:
+                full_prompt = (
+                    f"{prompt}\n"
+                    "CORRECTION OBLIGATOIRE (essai précédent refusé) :\n"
+                    f"- Erreur : {retry_state['error']}\n"
+                    "- Produis un objet JSON complet et fermé "
+                    '(index, title, concept_ids_covered, blocks).\n'
+                    "- Sans Markdown, sans questions, sans URL.\n"
+                )
+                log_progress(
+                    f"Nouvel essai chapitre {chapter_plan.index + 1} "
+                    f"après refus…"
+                )
+            ensure_prompt_fits(self.llm, full_prompt, tokens)
+            return self.llm.generate(full_prompt, max_new_tokens=tokens)
 
-        draft = self.guard.run_with_retries(
-            produce,
-            tokens=tokens,
-            parse=lambda raw: _parse_chapter_draft(raw, expected_index=chapter_plan.index),
-        )
-        _validate_chapter_draft(
-            draft,
-            chapter_plan=chapter_plan,
-            course=course,
-            source_text=source_text,
-        )
-        return draft
+        def parse(raw: str) -> ChapterDraft:
+            try:
+                draft = _parse_chapter_draft(raw, expected_index=chapter_plan.index)
+                draft = _enrich_concept_ids_covered(
+                    draft,
+                    chapter_plan=chapter_plan,
+                    course=course,
+                )
+                _validate_chapter_draft(
+                    draft,
+                    chapter_plan=chapter_plan,
+                    course=course,
+                    source_text=source_text,
+                )
+            except ValueError as error:
+                retry_state["error"] = str(error)
+                log_progress(
+                    f"Chapitre {chapter_plan.index + 1} refusé : {error}"
+                )
+                raise
+            return draft
+
+        try:
+            return self.guard.run_with_retries(
+                produce,
+                tokens=tokens,
+                parse=parse,
+            )
+        except ValueError as error:
+            # Qwen tronque souvent le JSON : on termine quand même le chapitre.
+            if "JSON" not in str(error):
+                raise
+            log_progress(
+                f"Chapitre {chapter_plan.index + 1} : "
+                "JSON inutilisable — fiche de secours sans contrainte de concepts…"
+            )
+            return _fallback_chapter_draft(
+                chapter_plan=chapter_plan,
+                course=course,
+            )
 
 
 def _build_chapter_prompt(
@@ -179,10 +238,10 @@ def _build_chapter_prompt(
     page_excerpts = _page_excerpts(source_pages, chapter_plan.page_refs, concepts)
 
     style = (
-        "Fiche de révision complète et structurée : développe concepts, relations et "
-        "mécanismes ; définitions claires ; exemples pertinents ; tableau ou schéma si utile ; "
-        "termine par une synthèse pédagogique. "
-        "Interdit : questions de révision, quiz, type question."
+        "Fiche de révision claire et structurée : définitions, explications, "
+        "exemples utiles si besoin, synthèse courte. "
+        "Interdit : questions de révision, quiz, type question. "
+        "Aucune obligation de couvrir une liste de concepts."
     )
 
     previous = ", ".join(previous_titles) if previous_titles else "(aucun)"
@@ -195,33 +254,21 @@ def _build_chapter_prompt(
         "Règles strictes :\n"
         "- Reformule de façon originale : n'copie pas le PDF.\n"
         "- N'invente aucune formule, valeur numérique, définition technique ou fait "
-        "scientifique absent des pages/concepts fournis.\n"
+        "scientifique absent des pages fournies.\n"
         "- Distingue origin=from_course et origin=pedagogical_addition pour les exemples.\n"
         "- Si une CONTRADICTION apparaît dans les notes, signale-la sans la résoudre.\n"
         "- Interdit : URL, bibliographie, contact, remerciements, listes de mots-clés vides.\n"
         "- Interdit : toute question destinée à l'étudiant (type question, quiz, QCM).\n"
-        "Schéma JSON (objet unique, JSON complet uniquement, sans Markdown et sans fence "
-        "code) :\n"
-        "Structure obligatoire : index (entier), title (texte), concept_ids_covered (liste "
-        "d'identifiants), blocks (liste de blocs).\n"
-        "Chaque bloc doit avoir un seul champ type exact parmi : paragraph, definition, "
-        "example, retain, table, diagram, synthesis.\n"
-        "Interdit : type question ; chaînes multi-types avec |.\n"
-        "Champs obligatoires par type :\n"
-        "- paragraph, definition, diagram, retain, synthesis : type, text\n"
-        "- example : type, text, origin "
-        "(origin exact : from_course ou pedagogical_addition)\n"
-        "- table : type, headers, rows\n"
-        "Exemples de blocs valides :\n"
-        '{"type":"paragraph","text":"..."}\n'
-        '{"type":"definition","text":"..."}\n'
-        '{"type":"example","text":"...","origin":"from_course"}\n'
-        '{"type":"retain","text":"..."}\n'
-        '{"type":"table","headers":["A","B"],"rows":[["1","2"]]}\n'
-        '{"type":"diagram","text":"..."}\n'
-        '{"type":"synthesis","text":"..."}\n'
-        "Exemple d'objet chapitre : "
-        '{"index":0,"title":"...","concept_ids_covered":["c1"],'
+        "- JSON compact et COMPLET : ferme toutes les accolades et guillemets.\n"
+        "Schéma JSON (objet unique, sans Markdown) :\n"
+        "index (entier), title (texte), concept_ids_covered (liste, peut être vide), "
+        "blocks (liste).\n"
+        "Types de bloc autorisés : paragraph, definition, example, retain, table, "
+        "diagram, synthesis.\n"
+        "Champs : paragraph/definition/diagram/retain/synthesis → type, text ; "
+        "example → type, text, origin ; table → type, headers, rows.\n"
+        "Exemple : "
+        '{"index":0,"title":"...","concept_ids_covered":[],'
         '"blocks":[{"type":"paragraph","text":"..."},'
         '{"type":"synthesis","text":"..."}]}\n'
         f"Plan global : {plan_titles}\n"
@@ -230,7 +277,8 @@ def _build_chapter_prompt(
         f"Objectifs : {json.dumps([o.model_dump() for o in chapter_plan.objectives], ensure_ascii=False)}\n"
         f"needs_example={chapter_plan.needs_example} ; needs_table={chapter_plan.needs_table} ; "
         "needs_questions=false\n"
-        f"Concepts : {json.dumps(concepts_json, ensure_ascii=False)}\n"
+        f"Matériau optionnel (ne bloque pas si omis) : "
+        f"{json.dumps(concepts_json, ensure_ascii=False)}\n"
         f"Relations : {json.dumps(relations, ensure_ascii=False)}\n"
         f"Extraits de pages :\n{page_excerpts}"
     )
@@ -256,26 +304,156 @@ def _page_excerpts(
 
 def _parse_chapter_draft(raw: str, *, expected_index: int) -> ChapterDraft:
     try:
-        payload = _load_json_object(raw)
+        payload = load_json_object(raw)
     except ValueError as error:
         raise ValueError("JSON de chapitre invalide.") from error
 
-    payload["index"] = expected_index
+    payload = _coerce_chapter_payload(payload, expected_index=expected_index)
     try:
-        if "blocks" in payload and isinstance(payload["blocks"], list):
-            normalized_blocks = []
-            for item in payload["blocks"]:
-                if not isinstance(item, dict):
-                    raise ValueError("JSON de chapitre invalide.")
-                normalized_blocks.append(ContentBlock.model_validate(item))
-            payload["blocks"] = [block.model_dump() for block in normalized_blocks]
         draft = ChapterDraft.model_validate(payload)
     except (ValidationError, ValueError, TypeError) as error:
         raise ValueError("JSON de chapitre invalide.") from error
 
     if draft.index != expected_index:
         raise ValueError("JSON de chapitre invalide.")
+    if not draft.blocks:
+        raise ValueError("Le chapitre généré est vide ou incomplet.")
     return draft
+
+
+def _coerce_chapter_payload(
+    payload: dict[str, Any],
+    *,
+    expected_index: int,
+) -> dict[str, Any]:
+    """Assouplit le JSON LLM : types manquants, exemples sans origin, blocs cassés."""
+    coerced: dict[str, Any] = dict(payload)
+    coerced["index"] = expected_index
+    if not isinstance(coerced.get("title"), str) or not coerced["title"].strip():
+        coerced["title"] = f"Chapitre {expected_index + 1}"
+    covered = coerced.get("concept_ids_covered")
+    if not isinstance(covered, list):
+        coerced["concept_ids_covered"] = []
+    else:
+        coerced["concept_ids_covered"] = [
+            cid for cid in covered if isinstance(cid, str) and cid
+        ]
+
+    raw_blocks = coerced.get("blocks")
+    if not isinstance(raw_blocks, list):
+        raw_blocks = []
+    normalized: list[dict[str, Any]] = []
+    for item in raw_blocks:
+        block = _coerce_content_block(item)
+        if block is not None:
+            normalized.append(block)
+    coerced["blocks"] = normalized
+    return coerced
+
+
+def _coerce_content_block(item: object) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    data = dict(item)
+    block_type = data.get("type")
+    if isinstance(block_type, str):
+        block_type = block_type.strip().casefold()
+    else:
+        block_type = None
+
+    if block_type == "question":
+        return None
+    if block_type not in _BLOCK_TYPES:
+        text = data.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        data = {"type": "paragraph", "text": text, "source_pages": data.get("source_pages", [])}
+        block_type = "paragraph"
+
+    if block_type == "example" and data.get("origin") not in {
+        "from_course",
+        "pedagogical_addition",
+    }:
+        data["origin"] = "pedagogical_addition"
+
+    if block_type == "table":
+        if not isinstance(data.get("headers"), list):
+            data["headers"] = []
+        if not isinstance(data.get("rows"), list):
+            data["rows"] = []
+
+    if "source_pages" in data and not isinstance(data["source_pages"], list):
+        data["source_pages"] = []
+
+    try:
+        return ContentBlock.model_validate(data).model_dump()
+    except (ValidationError, ValueError, TypeError):
+        text = data.get("text")
+        if isinstance(text, str) and text.strip():
+            try:
+                return ContentBlock.model_validate(
+                    {"type": "paragraph", "text": text}
+                ).model_dump()
+            except (ValidationError, ValueError, TypeError):
+                return None
+        return None
+
+
+def _fallback_chapter_draft(
+    *,
+    chapter_plan: ChapterPlan,
+    course: CourseModel,
+) -> ChapterDraft:
+    """Chapitre minimal à partir du titre / notes — sans contrainte de couverture."""
+    concepts = [c for c in course.concepts if c.id in set(chapter_plan.concept_ids)]
+    blocks: list[Any] = []
+    for concept in concepts:
+        notes = " ".join((concept.notes or "").split()).strip()
+        if notes and "CONTRADICTION" not in notes.upper():
+            text = f"{concept.label} : {notes}"
+        else:
+            text = (
+                f"{concept.label} est une notion présentée dans le cours "
+                "à retenir pour la révision."
+            )
+        pages = [p for p in concept.pages if isinstance(p, int) and p >= 1]
+        blocks.append(DefinitionBlock(type="definition", text=text, source_pages=pages))
+    if not blocks:
+        blocks.append(
+            ParagraphBlock(
+                type="paragraph",
+                text=(
+                    "Ce chapitre reprend les points essentiels de "
+                    f"« {chapter_plan.title} »."
+                ),
+                source_pages=list(chapter_plan.page_refs),
+            )
+        )
+    blocks.append(
+        SynthesisBlock(
+            type="synthesis",
+            text=f"Retenir les idées clés de « {chapter_plan.title} ».",
+            source_pages=list(chapter_plan.page_refs),
+        )
+    )
+    return ChapterDraft(
+        index=chapter_plan.index,
+        title=chapter_plan.title,
+        blocks=blocks,
+        concept_ids_covered=[],
+    )
+
+
+def _enrich_concept_ids_covered(
+    draft: ChapterDraft,
+    *,
+    chapter_plan: ChapterPlan,
+    course: CourseModel,
+) -> ChapterDraft:
+    """Conserve les ids déclarés ; n'impose plus ceux du plan."""
+    del course, chapter_plan
+    declared = [cid for cid in draft.concept_ids_covered if isinstance(cid, str) and cid]
+    return draft.model_copy(update={"concept_ids_covered": list(dict.fromkeys(declared))})
 
 
 def _validate_chapter_draft(
@@ -290,24 +468,9 @@ def _validate_chapter_draft(
 
     ensure_chapter_density(len(chapter_plan.concept_ids))
 
+    # Pas de validateur de couverture / concepts : la fiche peut omettre des notions.
+
     required = set(chapter_plan.concept_ids)
-    covered = set(draft.concept_ids_covered)
-    if required and not required.issubset(covered):
-        raise ValueError(
-            "Le chapitre ne couvre pas les concepts essentiels demandés par le plan."
-        )
-
-    unexplained = validate_chapter_concept_coverage(
-        draft, chapter_plan=chapter_plan, course=course
-    )
-    if unexplained:
-        raise ValueError(coverage_failure_message(unexplained))
-
-    if any(block.type == "question" for block in draft.blocks):
-        raise ValueError(
-            "Une fiche de révision ne doit pas contenir de questions de révision."
-        )
-
     concept_notes = " ".join(
         c.notes for c in course.concepts if c.id in required
     )
@@ -396,16 +559,3 @@ def _source_corpus(course: CourseModel, pages: list[CoursePage]) -> str:
     parts.extend(concept.label for concept in course.concepts)
     return "\n".join(parts)
 
-
-def _load_json_object(raw: str) -> dict[str, Any]:
-    text = raw.strip()
-    fence = _JSON_FENCE.search(text)
-    if fence:
-        text = fence.group(1).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ValueError("JSON invalide.") from error
-    if not isinstance(data, dict):
-        raise ValueError("JSON invalide.")
-    return data

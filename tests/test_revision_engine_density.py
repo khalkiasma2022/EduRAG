@@ -143,7 +143,7 @@ def _chapter_json(*, concept_ids: list[str], blocks: list[dict], index: int = 0)
 
 def test_density_constants_match_token_budget() -> None:
     assert MAX_CONCEPTS_PER_CHAPTER == 4
-    assert TOKENS_CHAPTER == 640
+    assert TOKENS_CHAPTER == 768
     assert MIN_TOKENS_PER_CONCEPT == TOKENS_CHAPTER // MAX_CONCEPTS_PER_CHAPTER
     assert MAX_COURSE_CONCEPTS == 40
     assert MAX_REWRITE_CHAPTERS == 2

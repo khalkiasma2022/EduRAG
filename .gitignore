@@ -15,6 +15,9 @@ data/documents/*
 data/vector_store/*
 !data/vector_store/.gitkeep
 
+# Téléchargements locaux (ex. roue PyTorch CUDA)
+.cache/
+
 # Python
 __pycache__/
 *.py[cod]

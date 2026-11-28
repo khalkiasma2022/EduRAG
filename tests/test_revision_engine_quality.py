@@ -323,17 +323,27 @@ def test_valid_document_passes_without_llm_rewrite() -> None:
     assert guard.calls == 0
 
 
-def test_missing_essential_concept_fails() -> None:
+def test_missing_essential_concept_no_longer_fails_quality() -> None:
+    """QC n'impose plus la couverture des concepts du plan."""
     document = _valid_document()
     document.chapters[0].concept_ids_covered = []
     document.chapters[0].blocks = [
-        ParagraphBlock(text="Texte vague sans couvrir la notion.", source_pages=[1])
+        ParagraphBlock(
+            text="Texte vague sans couvrir la notion essentielle demandée ici.",
+            source_pages=[1],
+        )
     ]
     llm = ScriptedLLM()
-    with pytest.raises(ValueError, match="essentiel|concept|qualité"):
-        QualityController(llm, LlmBudgetGuard()).review(
-            document, _course(), _plan(), source_pages=_pages()
-        )
+    reviewed, report = QualityController(llm, LlmBudgetGuard()).review(
+        document, _course(), _plan(), source_pages=_pages()
+    )
+    assert report.ok is True
+    assert not any(
+        issue.code in {"missing_essential_in_chapter", "unexplained_concept"}
+        for issue in report.issues
+    )
+    assert reviewed.chapters[0].concept_ids_covered == []
+    assert llm.calls == 0
 
 
 def test_missing_chapter_fails_without_partial_success() -> None:
